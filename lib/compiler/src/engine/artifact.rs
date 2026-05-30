@@ -505,7 +505,7 @@ impl Artifact {
         // mutable via `set_module_info_name`, and `name` is not part of
         // `VMOffsets`'s inputs), and (b) the host's pointer size doesn't
         // change at runtime.
-        let vm_offsets = VMOffsets::new(mem::size_of::<usize>() as u8, module_info);
+        let vm_offsets = VMOffsets::new(std::mem::size_of::<usize>() as u8, module_info);
 
         let mut artifact = Self {
             id: Default::default(),
@@ -1353,8 +1353,10 @@ impl Artifact {
             // its ModuleInfo before moving the variant into Self. Same
             // caching rationale as `Artifact::from_parts` above.
             let artifact_variant = ArtifactBuildVariant::Plain(artifact);
-            let vm_offsets =
-                VMOffsets::new(mem::size_of::<usize>() as u8, artifact_variant.module_info());
+            let vm_offsets = VMOffsets::new(
+                std::mem::size_of::<usize>() as u8,
+                artifact_variant.module_info(),
+            );
 
             Ok(Self {
                 id: Default::default(),
