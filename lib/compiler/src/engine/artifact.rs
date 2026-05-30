@@ -42,7 +42,6 @@ use wasmer_types::{
     target::{CpuFeature, Target},
 };
 
-use std::mem;
 use wasmer_types::VMOffsets;
 use wasmer_vm::{
     FunctionBodyPtr, InstanceAllocator, MemoryStyle, StoreObjects, TableStyle, TrapHandlerFn,
@@ -1350,9 +1349,16 @@ impl Artifact {
                 .collect::<PrimaryMap<LocalFunctionIndex, usize>>()
                 .into_boxed_slice();
 
+            // Build the variant first so we can compute VMOffsets from
+            // its ModuleInfo before moving the variant into Self. Same
+            // caching rationale as `Artifact::from_parts` above.
+            let artifact_variant = ArtifactBuildVariant::Plain(artifact);
+            let vm_offsets =
+                VMOffsets::new(mem::size_of::<usize>() as u8, artifact_variant.module_info());
+
             Ok(Self {
                 id: Default::default(),
-                artifact: ArtifactBuildVariant::Plain(artifact),
+                artifact: artifact_variant,
                 allocated: Some(AllocatedArtifact {
                     frame_info_registered: false,
                     frame_info_registration: None,
@@ -1363,6 +1369,7 @@ impl Artifact {
                         .into_boxed_slice(),
                     signatures: signatures.into_boxed_slice(),
                     finished_function_lengths,
+                    vm_offsets,
                 }),
             })
         }
