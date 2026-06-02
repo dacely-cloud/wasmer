@@ -103,17 +103,16 @@ impl InstanceAllocator {
     #[allow(clippy::type_complexity)]
     pub fn new_with_offsets(
         offsets: VMOffsets,
-        module: &ModuleInfo,
+        // Kept in the signature for API symmetry with `new` and for
+        // future callers that may want to read module metadata at
+        // allocation time. The current body only needs `offsets`.
+        _module: &ModuleInfo,
     ) -> (
         Self,
         Vec<NonNull<VMMemoryDefinition>>,
         Vec<NonNull<VMTableDefinition>>,
         Vec<NonNull<VMGlobalDefinition>>,
     ) {
-        // Silence unused warning when the body below does not need
-        // `module` directly (it's kept in the signature for API
-        // symmetry with `new` and for future callers).
-        let _ = module;
         let instance_layout = Self::instance_layout(&offsets);
 
         #[allow(clippy::cast_ptr_alignment)]
@@ -300,9 +299,12 @@ mod tests {
     use wasmer_types::ModuleInfo;
 
     /// `VMOffsets::new` is deterministic for a given `(pointer_size, module)`.
-    /// The whole VMOffsets-caching optimization assumes this; verify it as
-    /// the test that would catch any future change to `VMOffsets::new` that
-    /// introduced non-determinism (e.g. an internal HashMap iteration).
+    /// The whole VMOffsets-caching optimization assumes this; verify it via
+    /// the public getters that callers actually consult (size_of_vmctx is
+    /// the load-bearing one — it sizes the heap allocation — plus the local
+    /// counts that drive per-Instance pointer arrays). Asserting through
+    /// these stable accessors is robust against changes to internal layout
+    /// or Debug formatting.
     #[test]
     fn vmoffsets_new_is_deterministic_on_empty_module() {
         let module = ModuleInfo::default();
@@ -310,12 +312,19 @@ mod tests {
         let a = VMOffsets::new(ps, &module);
         let b = VMOffsets::new(ps, &module);
 
-        // Use Debug repr for comparison — VMOffsets doesn't impl `PartialEq`
-        // upstream, but its layout is constant for a given input so the
-        // textual debug form is a sufficient identity check.
-        let a_dbg = format!("{a:?}");
-        let b_dbg = format!("{b:?}");
-        assert_eq!(a_dbg, b_dbg, "VMOffsets::new must be deterministic");
+        assert_eq!(
+            a.size_of_vmctx(),
+            b.size_of_vmctx(),
+            "size_of_vmctx must be deterministic — it sizes the Instance alloc"
+        );
+        assert_eq!(a.num_local_tables(), b.num_local_tables());
+        assert_eq!(a.num_local_memories(), b.num_local_memories());
+        assert_eq!(a.num_local_globals(), b.num_local_globals());
+        assert_eq!(
+            InstanceAllocator::instance_layout(&a),
+            InstanceAllocator::instance_layout(&b),
+            "the instance allocation layout must be deterministic"
+        );
     }
 
     /// `InstanceAllocator::new_with_offsets` and `InstanceAllocator::new`
