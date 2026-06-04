@@ -7555,6 +7555,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "corosensei",
+ "criterion",
  "crossbeam-queue",
  "dashmap",
  "enum-iterator",
