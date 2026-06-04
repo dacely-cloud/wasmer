@@ -476,6 +476,11 @@ path = "examples/engine_cross_compilation.rs"
 required-features = ["cranelift"]
 
 [[example]]
+name = "backend-bench"
+path = "examples/backend_bench.rs"
+required-features = ["singlepass", "cranelift"]
+
+[[example]]
 name = "compiler-singlepass"
 path = "examples/compiler_singlepass.rs"
 required-features = ["singlepass"]
