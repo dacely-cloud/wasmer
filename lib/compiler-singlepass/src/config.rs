@@ -141,9 +141,31 @@ impl CompilerConfig for Singlepass {
         Box::new(SinglepassCompiler::new(*self))
     }
 
-    /// Gets the supported features for this compiler in the given target
+    /// Gets the supported features for this compiler in the given target.
+    ///
+    /// This is the source of truth for what the Singlepass backend can actually
+    /// codegen. Anything advertised here that the backend cannot emit would
+    /// otherwise pass module validation and then fail late during compilation
+    /// with a `"not yet implemented: <op>"` error, so the set must be kept in
+    /// sync with the operators handled in `codegen.rs`.
     fn supported_features_for_target(&self, _target: &Target) -> Features {
-        Features::default()
+        let mut feats = Features::default();
+
+        // Singlepass does not implement these proposals. Disabling them here
+        // means modules that use them are rejected cleanly during validation
+        // (e.g. "SIMD support is not enabled") instead of failing partway
+        // through codegen.
+        feats
+            .simd(false) // no v128 operators are lowered
+            .relaxed_simd(false) // depends on SIMD
+            .exceptions(false) // no try_table/throw/throw_ref lowering
+            .tail_call(false) // no return_call/return_call_indirect lowering
+            .wide_arithmetic(false) // not lowered
+            .module_linking(false) // unsupported
+            .multi_memory(false) // unsupported
+            .memory64(false); // no 64-bit heap index lowering
+
+        feats
     }
 
     /// Pushes a middleware onto the back of the middleware chain.
