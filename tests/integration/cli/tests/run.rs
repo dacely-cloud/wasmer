@@ -1,0 +1,1184 @@
+//! Basic tests for the `run` subcommand
+
+use std::{
+    fs::File,
+    io::{ErrorKind, Read},
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+};
+
+use assert_cmd::{assert::Assert, prelude::OutputAssertExt};
+use once_cell::sync::Lazy;
+use predicates::str::{contains, is_match};
+use rand::RngExt;
+use tempfile::TempDir;
+use wasmer_integration_tests_cli::{
+    asset_path,
+    fixtures::{self, packages, php, resources},
+    wasmer_command,
+};
+
+static RUST_LOG: Lazy<String> = Lazy::new(|| {
+    if cfg!(feature = "debug") {
+        "trace".to_string()
+    } else {
+        [
+            "info",
+            "wasmer_wasix::resolve=debug",
+            "wasmer_wasix::runners=debug",
+            "wasmer_wasix=debug",
+            "virtual_fs::trace_fs=trace",
+        ]
+        .join(",")
+    }
+});
+
+/// A version of `$RUST_LOG` used for checking cache messages.
+static CACHE_RUST_LOG: Lazy<String> = Lazy::new(|| {
+    [
+        "wasmer_wasix::runtime::resolver::wapm_source=debug",
+        "wasmer_wasix::runtime::resolver::web_source=debug",
+        "wasmer_wasix::runtime::package_loader::builtin_loader=debug",
+        "wasmer_wasix::runtime::module_cache::filesystem=debug",
+    ]
+    .join(",")
+});
+
+#[test]
+fn list_cwd() {
+    let package = packages().join("list-cwd");
+
+    let output = wasmer_command().arg("run").arg(package).output().unwrap();
+
+    let stdout = output.stdout;
+    eprintln!("{}", String::from_utf8(output.stderr).unwrap());
+
+    let expected = ".
+..
+.app
+.private
+bin
+data
+dev
+etc
+tmp
+usr
+"
+    .to_owned();
+
+    assert_eq!(expected, String::from_utf8(stdout).unwrap());
+}
+
+#[test]
+fn nested_mounted_paths() {
+    let package = packages().join("nested-mounted-paths");
+
+    let webc = package.join("out.webc");
+
+    let host_output = wasmer_command().arg("run").arg(package).output().unwrap();
+    let host_stdout = String::from_utf8(host_output.stdout).unwrap();
+
+    let webc_output = wasmer_command()
+        .arg("run")
+        .arg(webc)
+        .arg(".")
+        .output()
+        .unwrap();
+
+    let webc_stdout = String::from_utf8(webc_output.stdout).unwrap();
+
+    let expected = "/:
+.
+..
+.app
+.private
+app
+bin
+dev
+etc
+tmp
+usr
+
+/app:
+.
+..
+a
+b
+
+/app/a:
+.
+..
+data-a.txt
+
+/app/b:
+.
+..
+data-b.txt
+";
+
+    assert_eq!(&host_stdout, &expected);
+    assert_eq!(&webc_stdout, &expected);
+}
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
+#[test]
+fn run_python_create_temp_dir_in_subprocess() {
+    let resources = resources().join("python").join("temp-dir-in-child");
+
+    let output = wasmer_command()
+        .arg("run")
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg("--volume")
+        .arg(format!("{}:/code", resources.display()))
+        .arg("--")
+        .arg("/code/main.py")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.stdout, "0".as_bytes().to_vec());
+}
+
+#[test]
+fn run_php_with_sqlite() {
+    let (php_wasm, app_dir, db) = php();
+
+    let output = wasmer_command()
+        .arg("-q")
+        .arg("run")
+        .arg(php_wasm)
+        .arg("--volume")
+        .arg(format!("{}:/db", db.display()))
+        .arg("--volume")
+        .arg(format!("{}:/app", app_dir.display()))
+        .arg("--")
+        .arg("/app/test.php")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.stdout, "0".as_bytes().to_vec());
+}
+
+#[test]
+fn run_wasi_works() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::qjs())
+        .arg("--")
+        .arg("-e")
+        .arg("print(3 * (4 + 5))")
+        .assert()
+        .success();
+
+    assert.stdout("27\n");
+}
+
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+#[test]
+fn test_wasmer_run_pirita_works() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let python_wasmer_path = temp_dir.path().join("python.wasmer");
+    std::fs::copy(fixtures::python(), &python_wasmer_path).unwrap();
+
+    let output = wasmer_command()
+        .arg("run")
+        .arg(python_wasmer_path)
+        .arg("--")
+        .arg("-c")
+        .arg("print(\"hello\")")
+        .output()
+        .unwrap();
+
+    output.assert().success().stdout("hello\n");
+}
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
+#[test]
+fn test_wasmer_run_pirita_url_works() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg("--")
+        .arg("-c")
+        .arg("print(\"hello\")")
+        .assert()
+        .success();
+
+    assert.stdout("hello\n");
+}
+
+#[test]
+fn test_wasmer_run_works_with_dir() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let qjs_path = temp_dir.path().join("qjs.wasm");
+
+    std::fs::copy(fixtures::qjs(), qjs_path).unwrap();
+    std::fs::copy(
+        fixtures::qjs_wasmer_toml(),
+        temp_dir.path().join("wasmer.toml"),
+    )
+    .unwrap();
+
+    assert!(temp_dir.path().exists());
+    assert!(temp_dir.path().join("wasmer.toml").exists());
+    assert!(temp_dir.path().join("qjs.wasm").exists());
+
+    // test with "wasmer qjs.wasm"
+    wasmer_command()
+        .arg(temp_dir.path())
+        .arg("--")
+        .arg("--quit")
+        .assert()
+        .success();
+
+    // test again with "wasmer run qjs.wasm"
+    wasmer_command()
+        .arg("run")
+        .arg(temp_dir.path())
+        .arg("--")
+        .arg("--quit")
+        .assert()
+        .success();
+}
+
+#[test]
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+fn test_wasmer_run_works() {
+    let assert = wasmer_command()
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
+        .arg("test.py")
+        .assert()
+        .success();
+
+    assert.stdout("hello\n");
+
+    // same test again, but this time with "wasmer run ..."
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
+        .arg("test.py")
+        .assert()
+        .success();
+
+    assert.stdout("hello\n");
+
+    // same test again, but this time without specifying the registry in the URL
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
+        .arg("--registry=wasmer.io")
+        .arg("test.py")
+        .assert()
+        .success();
+
+    assert.stdout("hello\n");
+}
+
+#[test]
+fn run_no_imports_wasm_works() {
+    wasmer_command()
+        .arg("run")
+        .arg(fixtures::fib())
+        .assert()
+        .success();
+}
+
+#[test]
+fn run_wasi_works_non_existent() -> anyhow::Result<()> {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("does-not/exist")
+        .assert()
+        .failure();
+
+    assert
+        .stderr(contains(
+            "Unable to find \"does-not/exist\" in the registry",
+        ))
+        .stderr(contains("1: failed to query package"));
+
+    Ok(())
+}
+
+const PYTHON_PACKAGE_WITH_VERSION: &str = "python/python@3.13.5";
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
+#[test]
+fn run_test_caching_works_for_packages() {
+    // we're testing the cache, so we don't want to reuse the current user's
+    // $WASMER_DIR
+    let wasmer_dir = TempDir::new().unwrap();
+
+    let assert = wasmer_command()
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--registry=wasmer.io")
+        .arg("/app/test.py")
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .env("RUST_LOG", "debug")
+        .assert();
+
+    assert
+        .success()
+        .stderr(contains("backend_source: Querying the GraphQL API"))
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
+
+    let assert = wasmer_command()
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--registry=wasmer.io")
+        .arg("/app/test.py")
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .env("RUST_LOG", "debug")
+        .assert()
+        .success();
+
+    assert
+        .stderr(contains("backend_source: Cache hit!"))
+        .stderr(contains("builtin_loader: Cache hit!"))
+        .stderr(contains("module_cache::filesystem: Cache hit!"));
+}
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
+#[test]
+fn run_test_caching_works_for_packages_with_versions() {
+    let wasmer_dir = TempDir::new().unwrap();
+
+    let assert = wasmer_command()
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--registry=wasmer.io")
+        .arg("--cranelift")
+        .arg("/app/test.py")
+        .env("RUST_LOG", "debug")
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .assert()
+        .success();
+
+    assert
+        .success()
+        .stderr(contains("backend_source: Querying the GraphQL API"))
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
+
+    let assert = wasmer_command()
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--registry=wasmer.io")
+        .arg("--cranelift")
+        .arg("/app/test.py")
+        .env("RUST_LOG", "debug")
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .assert();
+
+    assert
+        .stderr(contains("backend_source: Cache hit!"))
+        .stderr(contains("builtin_loader: Cache hit!"))
+        .stderr(contains("module_cache::filesystem: Cache hit!"));
+}
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
+#[test]
+fn run_test_caching_works_for_urls() {
+    let wasmer_dir = TempDir::new().unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(format!("https://wasmer.io/{PYTHON_PACKAGE_WITH_VERSION}"))
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--cranelift")
+        .arg("/app/test.py")
+        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .assert()
+        .success();
+
+    assert
+        .success()
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(format!("https://wasmer.io/{PYTHON_PACKAGE_WITH_VERSION}"))
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--cranelift")
+        .arg("/app/test.py")
+        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("WASMER_CACHE_DIR", wasmer_dir.path())
+        .assert()
+        .success();
+
+    assert
+        // Got a cache hit downloading the *.webc file's metadata
+        .stderr(contains("web_source: Cache hit"))
+        // Cache hit downloading the *.webc file (it's identified based on sha256 hash - not the package name)
+        .stderr(contains("builtin_loader: Cache hit!"))
+        // Cache hit compiling the module
+        .stderr(contains("module_cache::filesystem: Cache hit!"));
+}
+
+// This test verifies that "wasmer run --invoke _start module.wat"
+// works the same as "wasmer run module.wat" (without --invoke).
+#[test]
+fn run_invoke_works_with_nomain_wasi() {
+    // In this example the function "wasi_unstable.arg_sizes_get"
+    // is a function that is imported from the WASI env.
+    let wasi_wat = "
+    (module
+        (import \"wasi_unstable\" \"args_sizes_get\"
+          (func $__wasi_args_sizes_get (param i32 i32) (result i32)))
+        (func $_start)
+        (memory 1)
+        (export \"memory\" (memory 0))
+        (export \"_start\" (func $_start))
+      )
+    ";
+
+    let random = rand::random::<u64>();
+    let module_file = std::env::temp_dir().join(format!("{random}.wat"));
+    std::fs::write(&module_file, wasi_wat.as_bytes()).unwrap();
+
+    wasmer_command()
+        .arg("run")
+        .arg(&module_file)
+        .assert()
+        .success();
+
+    wasmer_command()
+        .arg("run")
+        .arg("--invoke")
+        .arg("_start")
+        .arg(&module_file)
+        .assert()
+        .success();
+
+    std::fs::remove_file(&module_file).unwrap();
+}
+
+#[test]
+fn run_no_start_wasm_report_error() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::wat_no_start())
+        .assert()
+        .failure();
+
+    assert.stderr(contains("The module doesn't export a \"_start\" function"));
+}
+
+#[cfg(feature = "v8")]
+#[test]
+fn run_v8_wasi_proc_exit_zero_is_success() {
+    let wasi_wat = "
+    (module
+        (import \"wasi_snapshot_preview1\" \"proc_exit\"
+          (func $__wasi_proc_exit (param i32)))
+        (func $_start
+          i32.const 0
+          call $__wasi_proc_exit)
+        (memory 1)
+        (export \"memory\" (memory 0))
+        (export \"_start\" (func $_start))
+      )
+    ";
+
+    let temp = TempDir::new().unwrap();
+    let module_file = temp.path().join("proc_exit_zero.wat");
+    std::fs::write(&module_file, wasi_wat.as_bytes()).unwrap();
+
+    wasmer_command()
+        .arg("run")
+        .arg("--v8")
+        .arg(&module_file)
+        .assert()
+        .success();
+}
+
+// Test that wasmer can run a complex path
+#[test]
+fn test_wasmer_run_complex_url() {
+    let wasm_test_path = fixtures::qjs();
+    let wasm_test_path = wasm_test_path.canonicalize().unwrap_or(wasm_test_path);
+    let mut wasm_test_path = format!("{}", wasm_test_path.display());
+    if wasm_test_path.starts_with(r#"\\?\"#) {
+        wasm_test_path = wasm_test_path.replacen(r#"\\?\"#, "", 1);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        wasm_test_path = wasm_test_path.replace("D:\\", "D://");
+        wasm_test_path = wasm_test_path.replace("C:\\", "C://");
+        wasm_test_path = wasm_test_path.replace("c:\\", "c://");
+        wasm_test_path = wasm_test_path.replace("\\", "/");
+        // wasmer run used to fail on c:\Users\username\wapm_packages\ ...
+        assert!(
+            wasm_test_path.contains("://"),
+            "wasm_test_path path is not complex enough"
+        );
+    }
+
+    wasmer_command()
+        .arg("run")
+        .arg(wasm_test_path)
+        .arg("--")
+        .arg("-q")
+        .assert()
+        .success();
+}
+
+#[test]
+fn wasi_runner_on_disk() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::qjs())
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+// See <https://github.com/wasmerio/wasmer/issues/4010> for more.
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+#[test]
+fn wasi_runner_on_disk_mount_using_relative_directory_on_the_host() {
+    let temp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    std::fs::write(temp.path().join("main.py"), "print('Hello, World!')").unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::python())
+        .arg("--volume=.:/app")
+        .arg("--")
+        .arg("/app/main.py")
+        .env("RUST_LOG", &*RUST_LOG)
+        .current_dir(temp.path())
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+fn wasi_runner_on_disk_with_mounted_directories() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("index.js"), "console.log('Hello, World!')").unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::qjs())
+        .arg(format!("--volume={}:/app", temp.path().display()))
+        .arg("--")
+        .arg("/app/index.js")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_package_fs_mounts_work_for_dir_and_webc() {
+    let fixture = packages().join("fs-mount");
+    let temp = TempDir::new().unwrap();
+    let webc = temp.path().join("fs-mount-test.webc");
+
+    compile_wasix_source(
+        &fixture.join("main.c"),
+        &temp.path().join("main.wasm"),
+        false,
+    );
+    std::fs::copy(
+        fixture.join("testfile.txt"),
+        temp.path().join("testfile.txt"),
+    )
+    .unwrap();
+    std::fs::copy(fixture.join("wasmer.toml"), temp.path().join("wasmer.toml")).unwrap();
+
+    wasmer_command()
+        .arg("run")
+        .arg(temp.path())
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert()
+        .success();
+
+    wasmer_command()
+        .arg("-q")
+        .arg("package")
+        .arg("build")
+        .arg(".")
+        .arg("-o")
+        .arg(&webc)
+        .current_dir(temp.path())
+        .assert()
+        .success();
+
+    wasmer_command()
+        .arg("run")
+        .arg(&webc)
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert()
+        .success();
+}
+
+#[test]
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+fn wasi_runner_on_disk_with_mounted_directories_and_webc_volumes() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("main.py"), "print('Hello, World!')").unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::python())
+        .arg(format!("--volume={}:/app", temp.path().display()))
+        .arg("--")
+        .arg("-B")
+        .arg("/app/main.py")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+// For some reason the port forwarding does not work on macOS
+#[cfg_attr(target_os = "macos", ignore)]
+fn wasi_runner_on_disk_with_dependencies() {
+    let port = random_port();
+    let mut cmd = wasmer_command();
+    cmd.arg("run")
+        .arg("wasmer/hello")
+        .arg(format!("--env=SERVER_PORT={port}"))
+        .arg("--net")
+        .arg("--")
+        .arg("--log-level=info")
+        .env("RUST_LOG", &*RUST_LOG);
+    let mut child = JoinableChild::spawn(cmd);
+    child.wait_for_stderr("listening");
+
+    // Make sure we get the page we want
+    let html = reqwest::blocking::get(format!("http://localhost:{port}/"))
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(html.contains("<title>wasmer/hello</title>"), "{html}");
+
+    // and make sure our request was logged
+    child
+        .join()
+        .stderr(contains("incoming request: method=GET uri=/"));
+}
+
+#[test]
+fn webc_files_on_disk_with_multiple_commands_require_an_entrypoint_flag() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("wabt")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    let msg = r#"Unable to determine the package's entrypoint. Please choose one of ["wasm-interp", "wasm-strip", "wasm-validate", "wasm2wat", "wast2json", "wat2wasm"]"#;
+    assert.failure().stderr(contains(msg));
+}
+
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+#[test]
+fn wasi_runner_on_disk_with_env_vars() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::python())
+        .arg("--env=SOME_VAR=Hello, World!")
+        .arg("--")
+        .arg("-B")
+        .arg("-c")
+        .arg("import os; print(os.environ['SOME_VAR'])")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "wasmer/bash packages require wasm exception handling support on Windows"
+)]
+#[test]
+fn issue_3794_unable_to_mount_relative_paths() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("message.txt"), b"Hello, World!").unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
+        .arg("--llvm")
+        .arg("wasmer/bash")
+        .arg("--entrypoint=bash")
+        .arg(format!("--volume={}:./some-dir/", temp.path().display()))
+        .arg("--")
+        .arg("-c")
+        .arg("cat ./some-dir/message.txt")
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "wasmer/bash packages require wasm exception handling support on Windows"
+)]
+#[test]
+fn merged_filesystem_contains_all_files() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("wasmer/bash")
+        .arg("--entrypoint=bash")
+        .arg("--use")
+        .arg("python/python")
+        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
+        .arg("--llvm")
+        .arg("--")
+        .arg("-c")
+        .arg("ls -l /usr/local/lib/python3.13/*.py")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert
+        .success()
+        .stdout(contains("/usr/local/lib/python3.13/this.py"));
+}
+
+#[test]
+fn run_a_wasi_executable() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::qjs())
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+fn wasm_file_with_no_abi() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::fib())
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success();
+}
+
+#[test]
+fn error_if_no_start_function_found() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(fixtures::wat_no_start())
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert
+        .failure()
+        .stderr(contains("The module doesn't export a \"_start\" function"));
+}
+
+#[test]
+#[cfg_attr(
+    feature = "v8",
+    ignore = "wasmer using a c_api backend only may not have the 'compile' command"
+)]
+fn run_a_pre_compiled_wasm_file() {
+    let temp = TempDir::new().unwrap();
+    let dest = temp.path().join("qjs.wasmu");
+    let qjs = fixtures::qjs();
+    // Make sure it is compiled
+    wasmer_command()
+        .arg("compile")
+        .arg("-o")
+        .arg(&dest)
+        .arg(&qjs)
+        .assert()
+        .success();
+    assert!(dest.exists());
+
+    // Now we can try to run the compiled artifact
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(&dest)
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+fn wasmer_run_some_directory() {
+    let temp = TempDir::new().unwrap();
+    std::fs::copy(fixtures::qjs(), temp.path().join("qjs.wasm")).unwrap();
+    std::fs::copy(fixtures::qjs_wasmer_toml(), temp.path().join("wasmer.toml")).unwrap();
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(temp.path())
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+fn run_quickjs_via_package_name() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("saghul/quickjs")
+        .arg("--entrypoint=quickjs")
+        .arg("--registry=wasmer.io")
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[test]
+fn run_quickjs_via_url() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("https://wasmer.io/saghul/quickjs")
+        .arg("--entrypoint=quickjs")
+        .arg("--")
+        .arg("--eval")
+        .arg("console.log('Hello, World!')")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "wasmer/bash packages require wasm exception handling support on Windows"
+)]
+#[test]
+fn run_bash_using_coreutils() {
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("wasmer/bash")
+        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
+        .arg("--llvm")
+        .arg("--entrypoint=bash")
+        .arg("--use=wasmer/coreutils")
+        .arg("--registry=wasmer.io")
+        .arg("--")
+        .arg("-c")
+        .arg("ls /bin")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    // Note: the resulting filesystem should contain the main command as
+    // well as the commands from all the --use packages
+
+    let some_expected_binaries = [
+        "", "arch", "base32", "base64", "baseenc", "basename", "bash", "cat", "",
+    ]
+    .join("((?s)(.*))");
+
+    assert
+        .success()
+        .stdout(is_match(some_expected_binaries).unwrap());
+}
+
+#[test]
+fn run_a_package_that_uses_an_atom_from_a_dependency() {
+    let js_script_dir = project_root()
+        .join("tests")
+        .join("integration")
+        .join("cli")
+        .join("tests")
+        .join("packages")
+        .join("js-script");
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg(&js_script_dir)
+        .arg("--registry=wasmer.io")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert();
+
+    assert.success().stdout(contains("Hello, World!"));
+}
+
+// The test would be very slow on Windows and macOS
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
+#[test]
+fn local_package_has_write_access_to_its_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        temp.path().join("wasmer.toml"),
+        r#"
+[dependencies]
+"python/python" = "*"
+
+[fs]
+"/mounted" = "."
+
+[[command]]
+name = "run"
+module = "python/python:python"
+runner = "wasi"
+
+[command.annotations.wasi]
+main-args = ["/mounted/script.py"]
+
+        "#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        temp.path().join("script.py"),
+        r#"
+file = open("/mounted/hello.txt", "w")
+file.write("Hello, world!")
+        "#,
+    )
+    .unwrap();
+
+    wasmer_command()
+        .arg("run")
+        .arg(temp.path())
+        .arg("--registry=wasmer.io")
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert()
+        .success();
+
+    let file_contents =
+        String::from_utf8(std::fs::read(temp.path().join("hello.txt")).unwrap()).unwrap();
+    assert_eq!(file_contents, "Hello, world!");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shared_fd_closes_the_host_file_only_after_the_last_fd_is_closed() {
+    let fixture = packages().join("shared-fd");
+    let temp = TempDir::new().unwrap();
+    let wasm = temp.path().join("main.wasm");
+    let combined_log = temp.path().join("combined.log");
+    let output_path = temp.path().join("output");
+
+    compile_wasix_source(&fixture.join("main.c"), &wasm, false);
+
+    let mut cmd = wasmer_command();
+    cmd.arg("run")
+        .arg(&wasm)
+        .arg("--volume")
+        .arg(".")
+        .current_dir(temp.path())
+        .env("RUST_LOG", "virtual_fs=trace");
+
+    let (status, combined_output) = run_with_combined_output(&mut cmd, &combined_log);
+    assert!(status.success(), "{combined_output}");
+
+    let output = std::fs::read_to_string(&output_path).unwrap();
+    for expected in ["parent 1", "parent 2", "child 1", "child 2"] {
+        assert!(
+            output.contains(expected),
+            "missing `{expected}` in output file:\n{output}"
+        );
+    }
+
+    let closing_marker = combined_output.find("closing last fd").unwrap();
+    let close_log = combined_output
+        .find(&output_path.display().to_string())
+        .unwrap_or_else(|| panic!("missing close trace for output file:\n{combined_output}"));
+    let closed_marker = combined_output.find("last fd closed").unwrap();
+
+    assert!(
+        closing_marker < close_log && close_log < closed_marker,
+        "unexpected close ordering:\n{combined_output}"
+    );
+}
+
+fn project_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap()
+}
+
+/// A helper that wraps [`Child`] to make sure it gets terminated
+/// when it is no longer needed.
+struct JoinableChild {
+    command: Command,
+    child: Option<Child>,
+}
+
+impl JoinableChild {
+    fn spawn(mut cmd: Command) -> Self {
+        let child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        JoinableChild {
+            child: Some(child),
+            command: cmd,
+        }
+    }
+
+    /// Keep reading lines from the child's stderr until a line containing the
+    /// desired text is found.
+    fn wait_for_stderr(&mut self, text: &str) -> String {
+        let stderr = self
+            .child
+            .as_mut()
+            .and_then(|child| child.stderr.as_mut())
+            .unwrap();
+
+        wait_for(text, stderr)
+    }
+
+    /// Kill the underlying [`Child`] and get an [`Assert`] we
+    /// can use to check it.
+    fn join(mut self) -> Assert {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait_with_output().unwrap().assert()
+    }
+}
+
+fn wait_for(text: &str, reader: &mut dyn Read) -> String {
+    let mut all_output = String::new();
+
+    loop {
+        let line = read_line(reader).unwrap();
+
+        if line.is_empty() {
+            eprintln!("=== All Output === ");
+            eprintln!("{all_output}");
+            panic!("EOF before \"{text}\" was found");
+        }
+
+        let found = line.contains(text);
+        all_output.push_str(&line);
+
+        if found {
+            return all_output;
+        }
+    }
+}
+
+fn read_line(reader: &mut dyn Read) -> Result<String, std::io::Error> {
+    let mut line = Vec::new();
+
+    while !line.ends_with(b"\n") {
+        let mut buffer = [0_u8];
+        match reader.read_exact(&mut buffer) {
+            Ok(_) => {
+                line.push(buffer[0]);
+            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    let line = String::from_utf8(line).map_err(std::io::Error::other)?;
+    Ok(line)
+}
+
+#[cfg(target_os = "linux")]
+fn compile_wasix_source(source: &Path, output: &Path, use_eh: bool) {
+    let output = Command::new("wasixcc")
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .env("WASIXCC_WASM_EXCEPTIONS", if use_eh { "yes" } else { "no" })
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "failed to compile {}:\nstdout:\n{}\nstderr:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_with_combined_output(cmd: &mut Command, log_path: &Path) -> (ExitStatus, String) {
+    let stdout = File::create(log_path).unwrap();
+    let stderr = stdout.try_clone().unwrap();
+    let status = cmd
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .unwrap();
+    let output = std::fs::read_to_string(log_path).unwrap();
+    (status, output)
+}
+
+impl Drop for JoinableChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            eprintln!("==== WARNING: Child was dropped before being joined ====");
+            eprintln!("Command: {:?}", self.command);
+
+            let _ = child.kill();
+
+            if let Some(mut stderr) = child.stderr.take() {
+                let mut buffer = String::new();
+                if stderr.read_to_string(&mut buffer).is_ok() {
+                    eprintln!("---- STDERR ----");
+                    eprintln!("{buffer}");
+                }
+            }
+
+            if let Some(mut stdout) = child.stdout.take() {
+                let mut buffer = String::new();
+                if stdout.read_to_string(&mut buffer).is_ok() {
+                    eprintln!("---- STDOUT ----");
+                    eprintln!("{buffer}");
+                }
+            }
+
+            if !std::thread::panicking() {
+                panic!("Child was dropped before being joined");
+            }
+        }
+    }
+}
+
+fn random_port() -> u16 {
+    rand::rng().random_range(10_000_u16..u16::MAX)
+}

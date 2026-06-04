@@ -1,0 +1,45 @@
+[package]
+name = "wasmer-wasix-types"
+version = "0.702.0-alpha.3"
+description = "WASI and WASIX types for Wasmer WebAssembly runtime"
+categories = ["wasm", "os"]
+keywords = ["wasm", "webassembly", "wasi", "sandbox", "ABI"]
+readme = "README.md"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+wasmer = { default-features = false, path = "../api", version = "=7.2.0-alpha.3" }
+wasmer-types = { path = "../types", version = "=7.2.0-alpha.3" }
+wasmer-derive = { path = "../derive", version = "=7.2.0-alpha.3" }
+wai-bindgen-gen-rust.workspace = true
+wai-bindgen-rust = { workspace = true, default-features = false, features = [
+  "macros",
+] }
+wai-bindgen-gen-rust-wasm.workspace = true
+wai-bindgen-gen-core.workspace = true
+wai-parser.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
+num_enum.workspace = true
+bitflags.workspace = true
+cfg-if.workspace = true
+anyhow.workspace = true
+byteorder.workspace = true
+time = { workspace = true, features = ["formatting"] }
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[features]
+enable-serde = ["serde", "wasmer-types/serde"]
+
+[package.metadata.docs.rs]
+features = ["wasmer/sys", "wasmer/cranelift"]
+rustc-args = ["--cfg", "docsrs"]
