@@ -129,6 +129,26 @@ impl Instance {
     pub fn module(&self) -> &Module {
         &self.module
     }
+
+    /// Return a [`crate::Global`] handle for every DEFINED (non-imported)
+    /// global in this instance, INCLUDING globals the module does not
+    /// export. `self.exports` only contains exported globals, so a
+    /// non-exported mutable global (e.g. an allocator bump pointer that a
+    /// toolchain keeps internal) is invisible there and would leak state
+    /// across reuses of a pooled instance. Use this to snapshot and restore
+    /// the COMPLETE mutable-global state between calls. Empty on non-`sys`
+    /// backends.
+    pub fn defined_globals(&self, store: &mut impl AsStoreMut) -> Vec<crate::Global> {
+        let info = self.module.info();
+        let start = info.num_imported_globals;
+        let end = info.globals.len();
+        match &self._inner {
+            #[cfg(feature = "sys")]
+            BackendInstance::Sys(i) => i.defined_globals(store, start, end),
+            #[allow(unreachable_patterns)]
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Instance {
