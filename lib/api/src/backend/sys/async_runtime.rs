@@ -10,8 +10,40 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
+use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use dashmap::DashMap;
+
+thread_local! {
+    /// Per-thread pool of coroutine stacks reused across `call_async`
+    /// invocations. Allocating a fresh corosensei stack per call does an
+    /// `mmap` (+ guard-page `mprotect`) and freeing it does `munmap`; under
+    /// many threads those serialize on the kernel's per-process
+    /// `mmap_lock`, which collapses call_async throughput (measured: ~20x
+    /// per-call slowdown at 14 threads vs single-thread). Reusing stacks
+    /// removes the per-call mmap/munmap entirely.
+    static STACK_POOL: RefCell<Vec<DefaultStack>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cap on idle pooled stacks per thread (bounds resident memory; the pool
+/// only grows to the thread's actual concurrent-call count).
+const MAX_POOLED_STACKS: usize = 256;
+
+fn take_pooled_stack() -> DefaultStack {
+    STACK_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+fn return_pooled_stack(stack: DefaultStack) {
+    STACK_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < MAX_POOLED_STACKS {
+            pool.push(stack);
+        }
+        // else: drop -> munmap, bounding idle memory.
+    });
+}
 
 use super::entities::function::Function as SysFunction;
 use crate::{
@@ -115,8 +147,10 @@ impl AsStoreMut for AsyncCallStoreMut {
 impl AsyncCallFuture {
     pub(crate) fn new(function: SysFunction, store: StoreAsync, params: Vec<Value>) -> Self {
         let store_id = store.id;
-        let coroutine =
-            Coroutine::new(move |yielder: &Yielder<AsyncResume, AsyncYield>, resume| {
+        // Reuse a pooled stack instead of mmap'ing a fresh one per call.
+        let coroutine = Coroutine::with_stack(
+            take_pooled_stack(),
+            move |yielder: &Yielder<AsyncResume, AsyncYield>, resume| {
                 assert!(matches!(resume, AsyncResume::Start));
 
                 let ctx_state = CoroutineContext::new(yielder);
@@ -224,7 +258,12 @@ impl Future for AsyncCallFuture {
                     self.pending_future = Some(fut);
                 }
                 CoroutineResult::Return(result) => {
-                    self.coroutine = None;
+                    // Reclaim the finished coroutine's stack for reuse instead
+                    // of dropping it (which would munmap and re-contend the
+                    // mmap_lock on the next call).
+                    if let Some(coro) = self.coroutine.take() {
+                        return_pooled_stack(coro.into_stack());
+                    }
                     self.result = Some(result);
                 }
             }
