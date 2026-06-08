@@ -108,6 +108,46 @@ macro_rules! impl_native_traits {
                 }
             }
 
+            /// Typed async call that avoids the dynamic value-boxing of
+            /// `call_async` (no `Vec<Value>`/`Box<[Value]>`/`func.ty()`
+            /// allocations, no dynamic dispatch); runs the raw trampoline on a
+            /// pooled coroutine stack. Same suspension semantics as
+            /// `call_async`. Does NOT support `experimental-host-interrupt`
+            /// (a suspended typed call can't be remotely interrupted) -- use
+            /// `call_async` if you need that.
+            #[cfg(feature = "experimental-async")]
+            #[allow(unused_mut)]
+            #[allow(clippy::too_many_arguments)]
+            pub fn call_async_typed(
+                &self,
+                store: &impl AsStoreAsync,
+                $( $x: $x, )*
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> + Sized + 'static
+            where
+                $( $x: FromToNativeWasmType + 'static, )*
+                Rets: 'static + Unpin,
+            {
+                $(
+                    let [<p_ $x>] = $x;
+                )*
+                let store = store.store();
+                let func = self.func.clone();
+                async move {
+                    let read_lock = store.read_lock().await;
+                    match read_lock.as_store_ref().inner.store {
+                        #[cfg(feature = "sys")]
+                        BackendStore::Sys(_) => {
+                            drop(read_lock);
+                            Self::call_async_typed_sys(func, store, $([<p_ $x>]),*).await
+                        }
+                        #[cfg(feature = "v8")]
+                        BackendStore::V8(_) => async_backend_error(),
+                        #[cfg(feature = "js")]
+                        BackendStore::Js(_) => async_backend_error(),
+                    }
+                }
+            }
+
             #[doc(hidden)]
             #[allow(missing_docs)]
             #[allow(unused_mut)]

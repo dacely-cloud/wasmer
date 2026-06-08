@@ -133,6 +133,105 @@ macro_rules! impl_native_traits {
                 // Ok(Rets::from_c_struct(results))
             }
 
+            /// Typed async call. Runs the SAME zero-alloc raw trampoline as
+            /// `call_sys` (fixed stack arrays, no `Vec<Value>`/`Box<[Value]>`,
+            /// no `func.ty()`, no dynamic dispatch) but on a pooled coroutine
+            /// stack, so a suspending host import parks the call instead of
+            /// blocking the worker. Generic over the signature exactly like
+            /// `call_sys`. The store context is installed by the future's poll
+            /// before each resume, so `ensure_installed` here is a no-op
+            /// (same invariant the dynamic `call_wasm_raw` relies on).
+            #[allow(unused_mut)]
+            #[allow(clippy::too_many_arguments)]
+            #[cfg(feature = "experimental-async")]
+            pub(crate) fn call_async_typed_sys(
+                func: Function,
+                store: StoreAsync,
+                $( $x: $x, )*
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
+            where
+                $( $x: FromToNativeWasmType + 'static, )*
+                Rets: 'static + Unpin,
+            {
+                crate::backend::sys::async_runtime::call_function_async_typed(store, move |store| {
+                    let anyfunc = unsafe {
+                        *func.as_sys()
+                            .handle
+                            .get(store.as_store_ref().objects().as_sys())
+                            .anyfunc
+                            .as_ptr()
+                            .as_ref()
+                    };
+                    if $(!FromToNativeWasmType::is_from_store(&$x, store) ||)* false {
+                        return Err(RuntimeError::new(
+                            "cross-`Store` values are not supported",
+                        ));
+                    }
+                    let mut params_list = [ $( $x.to_native().into_raw(store) ),* ];
+                    let mut rets_list_array = Rets::empty_array();
+                    let rets_list: &mut [RawValue] = rets_list_array.as_mut();
+                    let using_rets_array;
+                    let args_rets: &mut [RawValue] = if params_list.len() > rets_list.len() {
+                        using_rets_array = false;
+                        params_list.as_mut()
+                    } else {
+                        using_rets_array = true;
+                        for (i, &arg) in params_list.iter().enumerate() {
+                            rets_list[i] = arg;
+                        }
+                        rets_list.as_mut()
+                    };
+
+                    let store_id = store.objects_mut().id();
+
+                    // Already installed by the future's poll -> no-op here.
+                    let store_install_guard = unsafe {
+                        StoreContext::ensure_installed(store.as_store_mut().inner as *mut _)
+                    };
+
+                    let mut r;
+                    loop {
+                        let storeref = store.as_store_ref();
+                        let config = storeref.engine().tunables().vmconfig();
+                        r = unsafe {
+                            let _pause_guard = StoreContext::pause(store_id);
+                            wasmer_vm::wasmer_call_trampoline(
+                                store.as_store_ref().signal_handler(),
+                                config,
+                                anyfunc.vmctx,
+                                anyfunc.call_trampoline,
+                                anyfunc.func_ptr,
+                                args_rets.as_mut_ptr() as *mut u8,
+                            )
+                        };
+                        let store_mut = store.as_store_mut();
+                        if let Some(callback) = store_mut.inner.on_called.take() {
+                            match callback(store_mut) {
+                                Ok(wasmer_types::OnCalledAction::InvokeAgain) => { continue; }
+                                Ok(wasmer_types::OnCalledAction::Finish) => { break; }
+                                Ok(wasmer_types::OnCalledAction::Trap(trap)) => { return Err(RuntimeError::user(trap)) },
+                                Err(trap) => { return Err(RuntimeError::user(trap)) },
+                            }
+                        }
+                        break;
+                    }
+
+                    drop(store_install_guard);
+
+                    r?;
+
+                    let num_rets = rets_list.len();
+                    if !using_rets_array && num_rets > 0 {
+                        let src_pointer = params_list.as_ptr();
+                        let rets_list = &mut rets_list_array.as_mut()[0] as *mut RawValue;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src_pointer, rets_list, num_rets);
+                        }
+                    }
+                    Ok(unsafe { Rets::from_array(store, rets_list_array) })
+                })
+            }
+
             /// Call the typed func asynchronously.
             #[allow(unused_mut)]
             #[allow(clippy::too_many_arguments)]
