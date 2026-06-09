@@ -88,6 +88,33 @@ struct PoolKey {
     mapping_size: usize,
 }
 
+/// Global runtime switch for the linear-memory mmap pool.
+///
+/// **OFF by default.** Recycling a mapping across wasm Instances aliases a
+/// tenant's `memory.grow` into a *different* instance's `VMMemoryDefinition`
+/// on the async dispatch path (the grow runs across a coroutine/host-stack
+/// switch), driving that instance's between-request reset through its
+/// read-only soft guard -> SIGSEGV / cross-tenant state. Root-caused with rr
+/// under multi-tenant async (see `wasm::pool::isolation_tests`). Instances are
+/// pooled at the host `PooledInstance` layer, so leaving this off only costs a
+/// fresh `mmap` at instance *build*, not in steady state.
+///
+/// Flip on with [`set_pool_enabled`] once the async grow-aliasing is fixed at
+/// the source.
+static POOL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable linear-memory mmap pooling process-wide. Off by default;
+/// see [`POOL_ENABLED`] for why.
+pub fn set_pool_enabled(enabled: bool) {
+    POOL_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the mmap pool is currently enabled (see [`set_pool_enabled`]).
+#[inline]
+pub(crate) fn pool_enabled() -> bool {
+    POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Maximum idle mappings per bucket per thread. Higher = better
 /// hit rate, more RSS held when idle. 8 is enough for most wasm
 /// hosts where a single thread bounces between a handful of
@@ -133,26 +160,10 @@ mod imp {
         static TLS_POOL: RefCell<Pool> = RefCell::new(Pool::new());
     }
 
-    /// Get an idle mapping with the requested exact shape, or `None`
-    /// if the pool has none.
-    ///
-    /// REUSE IS CURRENTLY DISABLED (always returns `None`). Recycling a
-    /// linear-memory mapping across wasm Instances aliases base pointers
-    /// between tenants; on the async dispatch path a tenant's `memory.grow`
-    /// runs across a coroutine/host-stack switch and writes `current_length`
-    /// through a `VMMemoryDefinition` that a *different* instance — one that
-    /// reused the mapping — then reads. The victim sees `current > initial`,
-    /// takes the grown reset path, and writes its initial image straight
-    /// through its read-only soft guard → SIGSEGV / cross-tenant state.
-    /// Reproduced and root-caused with rr under multi-tenant async (see
-    /// `wasm::pool::isolation_tests::repro_*`). Instances are pooled at the
-    /// `PooledInstance` layer, so steady-state throughput is unaffected —
-    /// only instance *build* pays a fresh `mmap`. Re-enable only once the
-    /// async grow-aliasing is fixed at the source.
-    #[allow(unreachable_code)]
+    /// Get an idle mapping with the requested exact shape, or `None` if the
+    /// pool is disabled (the default -- see [`POOL_ENABLED`]) or has none.
     pub(crate) fn try_take(accessible_size: usize, mapping_size: usize) -> Option<Mmap> {
-        return None;
-        if mapping_size == 0 {
+        if !super::pool_enabled() || mapping_size == 0 {
             return None;
         }
         let key = PoolKey {
@@ -177,6 +188,11 @@ mod imp {
     /// fails (pool full, draining, reset error, etc.) the original
     /// mapping is returned via `Some` and the caller MUST `munmap` it.
     pub(crate) fn try_pool(mut mmap: Mmap) -> Option<Mmap> {
+        // When the pool is disabled (default), nothing is ever taken, so there
+        // is no point holding idle mappings -- hand it back for `munmap`.
+        if !super::pool_enabled() {
+            return Some(mmap);
+        }
         let total = mmap.total_size_for_pool();
         if total == 0 {
             return Some(mmap);
