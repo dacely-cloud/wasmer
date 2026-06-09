@@ -135,7 +135,23 @@ mod imp {
 
     /// Get an idle mapping with the requested exact shape, or `None`
     /// if the pool has none.
+    ///
+    /// REUSE IS CURRENTLY DISABLED (always returns `None`). Recycling a
+    /// linear-memory mapping across wasm Instances aliases base pointers
+    /// between tenants; on the async dispatch path a tenant's `memory.grow`
+    /// runs across a coroutine/host-stack switch and writes `current_length`
+    /// through a `VMMemoryDefinition` that a *different* instance — one that
+    /// reused the mapping — then reads. The victim sees `current > initial`,
+    /// takes the grown reset path, and writes its initial image straight
+    /// through its read-only soft guard → SIGSEGV / cross-tenant state.
+    /// Reproduced and root-caused with rr under multi-tenant async (see
+    /// `wasm::pool::isolation_tests::repro_*`). Instances are pooled at the
+    /// `PooledInstance` layer, so steady-state throughput is unaffected —
+    /// only instance *build* pays a fresh `mmap`. Re-enable only once the
+    /// async grow-aliasing is fixed at the source.
+    #[allow(unreachable_code)]
     pub(crate) fn try_take(accessible_size: usize, mapping_size: usize) -> Option<Mmap> {
+        return None;
         if mapping_size == 0 {
             return None;
         }
