@@ -12,6 +12,7 @@ use wasmer::{Instance, Memory, Module, Store, imports};
 /// plus functions to mutate and observe each.
 const WAT: &str = r#"
 (module
+  (type $sig (func (result i32)))
   (memory (export "mem") 1 10)
   (global $g (export "g") (mut i32) (i32.const 7))
   (table $t (export "t") 3 funcref)
@@ -36,8 +37,41 @@ const WAT: &str = r#"
     (table.set $t (i32.const 1) (ref.func $f1)))
   (func (export "slot_is_null") (param $i i32) (result i32)
     (ref.is_null (table.get $t (local.get $i))))
+  (func (export "set_slot0_f1")
+    (table.set $t (i32.const 0) (ref.func $f1)))
+  (func (export "call0") (result i32)
+    (call_indirect $t (type $sig) (i32.const 0)))
 )
 "#;
+
+#[test]
+fn table_reset_visible_to_call_indirect() {
+    // Regression: `call_indirect` dispatches through the vmctx inline
+    // fixed-funcref array, NOT the `VMTable` backing vec. Restoring only the
+    // backing (or a `Value` round-trip) leaves a `table.set` visible to indirect
+    // calls; reset must re-sync the inline array.
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let exports = &instance.exports;
+    let call0 = exports.get_typed_function::<(), i32>(&store, "call0").unwrap();
+    let set_slot0 = exports
+        .get_typed_function::<(), ()>(&store, "set_slot0_f1")
+        .unwrap();
+
+    let snap = instance.snapshot(&store).unwrap();
+    assert_eq!(call0.call(&mut store).unwrap(), 100, "baseline: slot 0 = $f0");
+
+    set_slot0.call(&mut store).unwrap();
+    assert_eq!(call0.call(&mut store).unwrap(), 200, "mutated: slot 0 = $f1");
+
+    instance.reset_to_snapshot(&mut store, &snap).unwrap();
+    assert_eq!(
+        call0.call(&mut store).unwrap(),
+        100,
+        "reset must restore slot 0 as seen by call_indirect"
+    );
+}
 
 #[test]
 fn snapshot_round_trip_memory_global_table() {

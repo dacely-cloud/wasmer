@@ -9,7 +9,7 @@
 mod allocator;
 mod snapshot;
 
-pub use self::snapshot::VMInstanceSnapshot;
+pub use self::snapshot::{VMInstanceSnapshot, VMTablesSnapshot};
 
 use crate::LinearMemory;
 use crate::imports::Imports;

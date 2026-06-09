@@ -124,33 +124,54 @@ impl Instance {
         // `self`'s entity slices.
         let memories: Vec<_> = self.memories.values().copied().collect();
         let globals: Vec<_> = self.globals.values().copied().collect();
-        let tables: Vec<_> = self.tables.values().copied().collect();
 
-        // SAFETY: `self.context` is valid for the instance's lifetime and is not
-        // aliased while we hold this `&mut` (reset runs single-threaded between
-        // wasm calls).
-        let ctx = unsafe { &mut *self.context };
+        {
+            // SAFETY: `self.context` is valid for the instance's lifetime and is
+            // not aliased while we hold this `&mut` (reset runs single-threaded
+            // between wasm calls).
+            let ctx = unsafe { &mut *self.context };
 
-        for (h, mem_snap) in memories.iter().zip(&snap.memories) {
-            let mem = h.get_mut(ctx);
-            match mem_snap {
-                MemorySnapshot::Eager(image) => mem.restore_image(image)?,
-                MemorySnapshot::Cow(cow) => mem.restore_cow(cow)?,
+            for (h, mem_snap) in memories.iter().zip(&snap.memories) {
+                let mem = h.get_mut(ctx);
+                match mem_snap {
+                    MemorySnapshot::Eager(image) => mem.restore_image(image)?,
+                    MemorySnapshot::Cow(cow) => mem.restore_cow(cow)?,
+                }
+            }
+            for (h, &val) in globals.iter().zip(&snap.globals) {
+                // Write through the raw definition pointer; it lives in the
+                // vmctx, not in the `&VMGlobal` borrow.
+                unsafe {
+                    (*h.get(ctx).vmglobal().as_ptr()).val.u128 = val;
+                }
             }
         }
-        for (h, &val) in globals.iter().zip(&snap.globals) {
-            // Write through the raw definition pointer; it lives in the vmctx,
-            // not in the `&VMGlobal` borrow.
-            unsafe {
-                (*h.get(ctx).vmglobal().as_ptr()).val.u128 = val;
-            }
-        }
-        for (h, image) in tables.iter().zip(&snap.tables) {
-            h.get_mut(ctx).restore_elements(image);
-        }
+
+        // Tables: restore backing elements AND re-sync the vmctx inline
+        // fixed-funcref arrays that `call_indirect` dispatches through.
+        self.restore_table_elements(&snap.tables);
 
         self.reinitialize_passive_segments();
         Ok(())
+    }
+
+    /// Restore every defined table's raw elements, then re-sync the vmctx inline
+    /// fixed-funcref arrays. `call_indirect` dispatches through those inline
+    /// arrays, not the `VMTable` backing `vec`, so restoring the backing alone
+    /// would leave a `table.set` mutation visible to indirect calls.
+    fn restore_table_elements(&mut self, table_snaps: &[Vec<RawTableElement>]) {
+        let indices: Vec<_> = self.tables.keys().collect();
+        {
+            // SAFETY: see `restore`; single-threaded reset, no aliasing.
+            let ctx = unsafe { &mut *self.context };
+            for (idx, elems) in indices.iter().zip(table_snaps) {
+                let handle = self.tables[*idx];
+                handle.get_mut(ctx).restore_elements(elems);
+            }
+        }
+        for idx in &indices {
+            self.sync_fixed_funcref_table(*idx);
+        }
     }
 
     /// Reset the passive element and data segment maps back to the module's
@@ -209,5 +230,62 @@ impl VMInstance {
     /// if a memory could not be grown back to the snapshot size.
     pub fn reset_to_snapshot(&mut self, snapshot: &VMInstanceSnapshot) -> Result<(), MemoryError> {
         self.instance_mut().restore(snapshot)
+    }
+}
+
+/// A table-only snapshot: the raw element image of every defined table, in
+/// local-index order.
+///
+/// Unlike [`VMInstanceSnapshot`] this captures *only* tables — no linear memory
+/// and no globals — so an embedder can pair its own (possibly faster) memory and
+/// global reset with correct raw-element table restoration. Restoring copies the
+/// raw `funcref`/`externref` slots back verbatim, with no `Value` round-trip,
+/// which is exactly what reusing the *same* instance requires.
+pub struct VMTablesSnapshot {
+    tables: Vec<Vec<RawTableElement>>,
+}
+
+impl std::fmt::Debug for VMTablesSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VMTablesSnapshot")
+            .field("tables", &self.tables.len())
+            .finish()
+    }
+}
+
+impl Instance {
+    /// Capture the raw element image of every defined table.
+    pub(crate) fn snapshot_tables(&self) -> VMTablesSnapshot {
+        let ctx = self.context();
+        let tables = self
+            .tables
+            .values()
+            .map(|h| h.get(ctx).snapshot_elements())
+            .collect();
+        VMTablesSnapshot { tables }
+    }
+
+    /// Restore every defined table to a captured [`VMTablesSnapshot`].
+    pub(crate) fn restore_tables(&mut self, snap: &VMTablesSnapshot) -> Result<(), MemoryError> {
+        if snap.tables.len() != self.tables.len() {
+            return Err(MemoryError::Generic(
+                "tables snapshot does not match this instance's table count".into(),
+            ));
+        }
+        self.restore_table_elements(&snap.tables);
+        Ok(())
+    }
+}
+
+impl VMInstance {
+    /// Capture a table-only snapshot (see [`VMTablesSnapshot`]). Narrower than
+    /// [`VMInstance::snapshot`]: it touches no linear memory and no globals.
+    pub fn snapshot_tables(&self) -> VMTablesSnapshot {
+        self.instance().snapshot_tables()
+    }
+
+    /// Restore every defined table to a previously captured [`VMTablesSnapshot`].
+    pub fn reset_tables(&mut self, snapshot: &VMTablesSnapshot) -> Result<(), MemoryError> {
+        self.instance_mut().restore_tables(snapshot)
     }
 }
