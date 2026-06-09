@@ -1,0 +1,213 @@
+//! Snapshot and restore of a warm instance's mutable state.
+//!
+//! Captures the post-initialization baseline of an [`Instance`] — its defined
+//! linear memories, globals, and tables — so the same instance can be reset and
+//! reused for many runs instead of being re-instantiated. Re-instantiation
+//! re-allocates memories, re-links imports, and re-runs the start function;
+//! resetting to a snapshot skips all of that.
+//!
+//! This is the eager, portable path: snapshot copies each memory image into a
+//! `Vec<u8>`, and restore copies it back. A Linux `memfd` + `madvise(MADV_DONTNEED)`
+//! copy-on-write fast path can later be layered behind the same API to make
+//! restore cost O(dirty pages) instead of O(heap size).
+
+use std::sync::Arc;
+
+use wasmer_types::{ElemIndex, MemoryError};
+
+use super::{Instance, VMInstance};
+use crate::table::RawTableElement;
+use crate::{CowBacking, LinearMemory, VMFuncRef};
+
+/// How a single linear memory's baseline is captured.
+enum MemorySnapshot {
+    /// Eager byte image (portable; used for dynamic memories, shared memories,
+    /// non-Linux targets, or when a `memfd` could not be created).
+    Eager(Vec<u8>),
+    /// Copy-on-write backing: restore re-maps the live memory over a `memfd`,
+    /// discarding dirtied pages in a single syscall (O(dirty pages)).
+    Cow(CowBacking),
+}
+
+/// Whether copy-on-write acceleration is disabled via the environment. Provides
+/// an operational escape hatch (`WASMER_DISABLE_INSTANCE_COW=1`) that forces the
+/// eager path without changing observable behavior — both paths restore to the
+/// same bytes.
+fn cow_disabled() -> bool {
+    std::env::var_os("WASMER_DISABLE_INSTANCE_COW").is_some()
+}
+
+/// An immutable snapshot of an instance's mutable state, captured by
+/// [`VMInstance::snapshot`] and restored by [`VMInstance::reset_to_snapshot`].
+///
+/// The snapshot owns copies of every defined memory image, global value, and
+/// table image. It is only meaningful for the instance it was taken from, and
+/// the caller must keep that instance alive for the snapshot's lifetime: table
+/// images hold raw func/extern refs that point into the instance.
+pub struct VMInstanceSnapshot {
+    /// One baseline per defined (local) linear memory, in local-index order.
+    memories: Vec<MemorySnapshot>,
+    /// One raw value per defined (local) global, in local-index order.
+    globals: Vec<u128>,
+    /// One element image per defined (local) table, in local-index order.
+    tables: Vec<Vec<RawTableElement>>,
+}
+
+impl std::fmt::Debug for VMInstanceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VMInstanceSnapshot")
+            .field("memories", &self.memories.len())
+            .field("globals", &self.globals.len())
+            .field("tables", &self.tables.len())
+            .finish()
+    }
+}
+
+impl Instance {
+    /// Capture this instance's defined memories, globals, and tables.
+    pub(crate) fn snapshot(&self) -> VMInstanceSnapshot {
+        let ctx = self.context();
+        let allow_cow = !cow_disabled();
+
+        let memories = self
+            .memories
+            .values()
+            .map(|h| {
+                let mem = h.get(ctx);
+                // Prefer the O(dirty-pages) copy-on-write path; fall back to the
+                // eager byte image if it is unsupported or a memfd could not be
+                // created.
+                if allow_cow
+                    && mem.supports_cow_snapshot()
+                    && let Ok(cow) = mem.snapshot_cow()
+                {
+                    return MemorySnapshot::Cow(cow);
+                }
+                MemorySnapshot::Eager(mem.snapshot_image())
+            })
+            .collect();
+
+        let globals = self
+            .globals
+            .values()
+            .map(|h| unsafe { (*h.get(ctx).vmglobal().as_ptr()).val.u128 })
+            .collect();
+
+        let tables = self
+            .tables
+            .values()
+            .map(|h| h.get(ctx).snapshot_elements())
+            .collect();
+
+        VMInstanceSnapshot {
+            memories,
+            globals,
+            tables,
+        }
+    }
+
+    /// Restore this instance's defined memories, globals, and tables to a
+    /// previously captured [`VMInstanceSnapshot`], then re-populate the passive
+    /// data/element segments (undoing any `data.drop` / `elem.drop`).
+    pub(crate) fn restore(&mut self, snap: &VMInstanceSnapshot) -> Result<(), MemoryError> {
+        if snap.memories.len() != self.memories.len()
+            || snap.globals.len() != self.globals.len()
+            || snap.tables.len() != self.tables.len()
+        {
+            return Err(MemoryError::Generic(
+                "snapshot does not match this instance's shape".into(),
+            ));
+        }
+
+        // Store handles are `Copy`; collect them up front so each `&mut
+        // StoreObjects` borrow below does not entangle with the borrow of
+        // `self`'s entity slices.
+        let memories: Vec<_> = self.memories.values().copied().collect();
+        let globals: Vec<_> = self.globals.values().copied().collect();
+        let tables: Vec<_> = self.tables.values().copied().collect();
+
+        // SAFETY: `self.context` is valid for the instance's lifetime and is not
+        // aliased while we hold this `&mut` (reset runs single-threaded between
+        // wasm calls).
+        let ctx = unsafe { &mut *self.context };
+
+        for (h, mem_snap) in memories.iter().zip(&snap.memories) {
+            let mem = h.get_mut(ctx);
+            match mem_snap {
+                MemorySnapshot::Eager(image) => mem.restore_image(image)?,
+                MemorySnapshot::Cow(cow) => mem.restore_cow(cow)?,
+            }
+        }
+        for (h, &val) in globals.iter().zip(&snap.globals) {
+            // Write through the raw definition pointer; it lives in the vmctx,
+            // not in the `&VMGlobal` borrow.
+            unsafe {
+                (*h.get(ctx).vmglobal().as_ptr()).val.u128 = val;
+            }
+        }
+        for (h, image) in tables.iter().zip(&snap.tables) {
+            h.get_mut(ctx).restore_elements(image);
+        }
+
+        self.reinitialize_passive_segments();
+        Ok(())
+    }
+
+    /// Reset the passive element and data segment maps back to the module's
+    /// declared set, undoing any `elem.drop` / `data.drop` a run performed.
+    fn reinitialize_passive_segments(&self) {
+        {
+            let mut passive_elements = self.passive_elements.borrow_mut();
+            passive_elements.clear();
+            passive_elements.extend(self.module.passive_elements.iter().filter_map(
+                |(&idx, segments)| -> Option<(ElemIndex, Box<[Option<VMFuncRef>]>)> {
+                    if segments.is_empty() {
+                        None
+                    } else {
+                        Some((
+                            idx,
+                            segments
+                                .iter()
+                                .map(|s| self.func_ref(*s))
+                                .collect::<Box<[Option<VMFuncRef>]>>(),
+                        ))
+                    }
+                },
+            ));
+        }
+
+        {
+            let mut passive_data = self.passive_data.borrow_mut();
+            passive_data.clear();
+            passive_data.extend(
+                self.module
+                    .passive_data
+                    .clone()
+                    .into_iter()
+                    .map(|(idx, bytes)| (idx, Arc::from(bytes))),
+            );
+        }
+    }
+}
+
+impl VMInstance {
+    /// Capture a snapshot of this instance's mutable state (defined memories,
+    /// globals, and tables) so it can later be restored with
+    /// [`VMInstance::reset_to_snapshot`].
+    ///
+    /// Take the snapshot once the instance has reached the baseline you want to
+    /// reuse (after data/element segments, the start function, and any embedder
+    /// initialization). Host-side state (imported memories/globals, function
+    /// environments) is not captured and must be managed by the embedder.
+    pub fn snapshot(&self) -> VMInstanceSnapshot {
+        self.instance().snapshot()
+    }
+
+    /// Restore this instance to a previously captured [`VMInstanceSnapshot`].
+    ///
+    /// Returns an error if the snapshot's shape does not match this instance, or
+    /// if a memory could not be grown back to the snapshot size.
+    pub fn reset_to_snapshot(&mut self, snapshot: &VMInstanceSnapshot) -> Result<(), MemoryError> {
+        self.instance_mut().restore(snapshot)
+    }
+}

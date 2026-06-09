@@ -291,6 +291,29 @@ impl VMTable {
         self.get_vm_table_definition()
     }
 
+    /// Capture the current table contents as a raw element image.
+    ///
+    /// Pair with [`VMTable::restore_elements`] to snapshot and restore a warm
+    /// instance's tables. The raw elements are `Copy`; the caller must keep the
+    /// owning instance alive so the captured func/extern refs stay valid.
+    pub fn snapshot_elements(&self) -> Vec<RawTableElement> {
+        self.vec.clone()
+    }
+
+    /// Restore the table contents and size to a captured
+    /// [`snapshot_elements`](VMTable::snapshot_elements) image.
+    pub fn restore_elements(&mut self, elements: &[RawTableElement]) {
+        self.vec.clear();
+        self.vec.extend_from_slice(elements);
+        // Keep the VM-visible definition in sync with the resized backing vec.
+        unsafe {
+            let mut td = self.get_vm_table_definition();
+            let td = td.as_mut();
+            td.current_elements = self.vec.len() as u32;
+            td.base = self.vec.as_mut_ptr() as _;
+        }
+    }
+
     /// Copy `len` elements from `src_table[src_index..]` into `dst_table[dst_index..]`.
     ///
     /// # Errors

@@ -2,9 +2,9 @@
 
 use crate::{
     Extern, error::InstantiationError, exports::Exports, imports::Imports, module::Module,
-    store::AsStoreMut,
+    store::{AsStoreMut, AsStoreRef},
 };
-use wasmer_vm::{StoreHandle, VMInstance};
+use wasmer_vm::{StoreHandle, VMInstance, VMInstanceSnapshot};
 
 use super::store::Store;
 
@@ -77,6 +77,25 @@ impl Instance {
                 (name, extern_)
             })
             .collect::<Exports>()
+    }
+
+    /// Capture a snapshot of this instance's mutable state (defined memories,
+    /// globals, and tables). See [`wasmer_vm::VMInstance::snapshot`].
+    pub(crate) fn snapshot(&self, store: &impl AsStoreRef) -> VMInstanceSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot()
+    }
+
+    /// Restore this instance to a previously captured snapshot.
+    pub(crate) fn reset_to_snapshot(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMInstanceSnapshot,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_to_snapshot(snapshot)
     }
 }
 
