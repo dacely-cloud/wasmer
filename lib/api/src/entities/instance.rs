@@ -196,6 +196,61 @@ impl Instance {
             )),
         }
     }
+
+    /// Capture a snapshot of this instance's defined tables only — no linear
+    /// memory and no globals.
+    ///
+    /// Use this when you already reset memory and globals yourself (e.g. a
+    /// bespoke fast path) and only need correct, raw-element table restoration.
+    /// Restoring copies the raw `funcref`/`externref` slots back verbatim, with
+    /// no `Value` round-trip. Only supported on the `sys` backend.
+    #[cfg(feature = "sys")]
+    pub fn snapshot_tables(&self, store: &impl AsStoreRef) -> Result<TablesSnapshot, RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => Ok(TablesSnapshot {
+                inner: i.snapshot_tables(store),
+            }),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::snapshot_tables is only supported on the sys backend",
+            )),
+        }
+    }
+
+    /// Restore every defined table to a previously captured [`TablesSnapshot`],
+    /// undoing any `table.set` / `table.grow` since the snapshot. Only supported
+    /// on the `sys` backend.
+    #[cfg(feature = "sys")]
+    pub fn reset_tables(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &TablesSnapshot,
+    ) -> Result<(), RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => i
+                .reset_tables(store, &snapshot.inner)
+                .map_err(|e| RuntimeError::new(e.to_string())),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::reset_tables is only supported on the sys backend",
+            )),
+        }
+    }
+}
+
+/// An opaque table-only snapshot produced by [`Instance::snapshot_tables`] and
+/// consumed by [`Instance::reset_tables`]. Keep the originating [`Instance`]
+/// alive while it is in use. Only available on the `sys` backend.
+#[cfg(feature = "sys")]
+pub struct TablesSnapshot {
+    inner: wasmer_vm::VMTablesSnapshot,
+}
+
+#[cfg(feature = "sys")]
+impl std::fmt::Debug for TablesSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
+    }
 }
 
 /// An opaque snapshot of an [`Instance`]'s mutable state, produced by

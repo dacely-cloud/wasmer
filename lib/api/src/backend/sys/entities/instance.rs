@@ -5,7 +5,7 @@ use crate::{
     store::{AsStoreMut, AsStoreRef},
 };
 use wasmer_types::{ExportIndex, GlobalIndex};
-use wasmer_vm::{StoreHandle, VMInstance, VMInstanceSnapshot};
+use wasmer_vm::{StoreHandle, VMInstance, VMInstanceSnapshot, VMTablesSnapshot};
 
 use super::store::Store;
 
@@ -128,6 +128,25 @@ impl Instance {
         self._handle
             .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
             .reset_to_snapshot(snapshot)
+    }
+
+    /// Capture a table-only snapshot (no memory/globals). See
+    /// [`wasmer_vm::VMInstance::snapshot_tables`].
+    pub(crate) fn snapshot_tables(&self, store: &impl AsStoreRef) -> VMTablesSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot_tables()
+    }
+
+    /// Restore every defined table to a previously captured table snapshot.
+    pub(crate) fn reset_tables(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMTablesSnapshot,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_tables(snapshot)
     }
 }
 
