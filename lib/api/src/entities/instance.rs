@@ -1,7 +1,9 @@
 use crate::{
-    Extern, error::InstantiationError, exports::Exports, imports::Imports,
+    Extern, RuntimeError, error::InstantiationError, exports::Exports, imports::Imports,
     macros::backend::gen_rt_ty, module::Module, store::AsStoreMut,
 };
+#[cfg(feature = "sys")]
+use crate::store::AsStoreRef;
 
 /// A WebAssembly Instance is a stateful, executable
 /// instance of a WebAssembly [`Module`].
@@ -148,6 +150,68 @@ impl Instance {
             #[allow(unreachable_patterns)]
             _ => Vec::new(),
         }
+    }
+
+    /// Capture a snapshot of this instance's mutable state — its defined linear
+    /// memories, globals, and tables — so the instance can be reset and reused
+    /// instead of being re-instantiated.
+    ///
+    /// Take the snapshot once the instance has reached the baseline you want to
+    /// reuse for every run (after the `start` function and any embedder
+    /// initialization). Host-side state (imported memories/globals, function
+    /// environments) is not captured and remains the embedder's responsibility.
+    ///
+    /// Only supported on the `sys` backend; other backends return an error.
+    #[cfg(feature = "sys")]
+    pub fn snapshot(&self, store: &impl AsStoreRef) -> Result<InstanceSnapshot, RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => Ok(InstanceSnapshot {
+                inner: i.snapshot(store),
+            }),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::snapshot is only supported on the sys backend",
+            )),
+        }
+    }
+
+    /// Restore this instance to a previously captured [`InstanceSnapshot`],
+    /// undoing every memory/global/table mutation (and any `data.drop` /
+    /// `elem.drop`) performed since the snapshot was taken.
+    ///
+    /// Only supported on the `sys` backend; other backends return an error.
+    #[cfg(feature = "sys")]
+    pub fn reset_to_snapshot(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &InstanceSnapshot,
+    ) -> Result<(), RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => i
+                .reset_to_snapshot(store, &snapshot.inner)
+                .map_err(|e| RuntimeError::new(e.to_string())),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::reset_to_snapshot is only supported on the sys backend",
+            )),
+        }
+    }
+}
+
+/// An opaque snapshot of an [`Instance`]'s mutable state, produced by
+/// [`Instance::snapshot`] and consumed by [`Instance::reset_to_snapshot`].
+///
+/// Keep the originating [`Instance`] alive while the snapshot is in use. Only
+/// available on the `sys` backend.
+#[cfg(feature = "sys")]
+pub struct InstanceSnapshot {
+    inner: wasmer_vm::VMInstanceSnapshot,
+}
+
+#[cfg(feature = "sys")]
+impl std::fmt::Debug for InstanceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
     }
 }
 

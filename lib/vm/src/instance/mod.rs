@@ -7,6 +7,9 @@
 //! how it is allocated and deallocated.
 
 mod allocator;
+mod snapshot;
+
+pub use self::snapshot::VMInstanceSnapshot;
 
 use crate::LinearMemory;
 use crate::imports::Imports;

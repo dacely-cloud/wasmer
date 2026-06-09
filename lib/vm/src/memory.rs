@@ -158,6 +158,48 @@ impl WasmMmap {
         Ok(())
     }
 
+    /// Restore the memory image and logical size to a captured snapshot.
+    ///
+    /// Grows the backing allocation if the snapshot is larger than the current
+    /// logical size, copies `image` into `[0, image.len())`, zeroes any pages
+    /// above the snapshot (so a later grow sees zeros), then shrinks the logical
+    /// size back down to the snapshot.
+    fn restore_image(&mut self, image: &[u8], conf: VMMemoryConfig) -> Result<(), MemoryError> {
+        let target_bytes = image.len();
+        let target_pages: Pages = Bytes::from(target_bytes)
+            .try_into()
+            .map_err(|_| MemoryError::Generic("snapshot image size overflows pages".into()))?;
+
+        // Grow back up if the snapshot is larger than the current logical size.
+        if target_pages > self.size {
+            let delta = target_pages - self.size;
+            self.grow(delta, conf)?;
+        }
+
+        // `[0, self.size)` is now accessible and `self.size >= target_pages`.
+        let (base, live_bytes) = unsafe {
+            let md = self.vm_memory_definition.as_ptr();
+            let md = md.as_ref();
+            (md.base, md.current_length)
+        };
+        unsafe {
+            if live_bytes > target_bytes {
+                // Zero pages above the snapshot so a future `memory.grow` exposes
+                // zero-initialized memory (Wasm spec) and no prior-run data leaks.
+                std::ptr::write_bytes(base.add(target_bytes), 0u8, live_bytes - target_bytes);
+            }
+            slice::from_raw_parts_mut(base, target_bytes).copy_from_slice(image);
+        }
+
+        // Shrink the logical view back down to the snapshot size.
+        self.size = target_pages;
+        unsafe {
+            let mut md = self.vm_memory_definition.as_ptr();
+            md.as_mut().current_length = target_bytes;
+        }
+        Ok(())
+    }
+
     /// Copies the memory
     /// (in this case it performs a copy-on-write to save memory)
     pub fn copy(&self) -> Result<Self, MemoryError> {
@@ -437,6 +479,44 @@ impl LinearMemory for VMOwnedMemory {
         Ok(())
     }
 
+    /// Restore the memory contents and size to a captured snapshot image.
+    fn restore_image(&mut self, image: &[u8]) -> Result<(), MemoryError> {
+        self.mmap.restore_image(image, self.config.clone())
+    }
+
+    /// Copy-on-write snapshots are supported for static-style memories on Linux,
+    /// whose base address never moves on `memory.grow`.
+    fn supports_cow_snapshot(&self) -> bool {
+        cfg!(target_os = "linux") && matches!(self.config.style(), MemoryStyle::Static { .. })
+    }
+
+    fn snapshot_cow(&self) -> Result<CowBacking, MemoryError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.mmap.snapshot_cow()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(MemoryError::UnsupportedOperation {
+                message: "snapshot_cow() is only supported on Linux".to_string(),
+            })
+        }
+    }
+
+    fn restore_cow(&mut self, cow: &CowBacking) -> Result<(), MemoryError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.mmap.restore_cow(cow)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cow;
+            Err(MemoryError::UnsupportedOperation {
+                message: "restore_cow() is only supported on Linux".to_string(),
+            })
+        }
+    }
+
     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
     fn vmmemory(&self) -> NonNull<VMMemoryDefinition> {
         self.mmap.vm_memory_definition.as_ptr()
@@ -594,6 +674,12 @@ impl LinearMemory for VMSharedMemory {
         Ok(())
     }
 
+    /// Restore the memory contents and size to a captured snapshot image.
+    fn restore_image(&mut self, image: &[u8]) -> Result<(), MemoryError> {
+        let mut guard = self.mmap.write().unwrap();
+        guard.restore_image(image, self.config.clone())
+    }
+
     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
     fn vmmemory(&self) -> NonNull<VMMemoryDefinition> {
         let guard = self.mmap.read().unwrap();
@@ -691,6 +777,23 @@ impl LinearMemory for VMMemory {
     fn reset(&mut self) -> Result<(), MemoryError> {
         self.0.reset()?;
         Ok(())
+    }
+
+    /// Restore the memory contents and size to a captured snapshot image.
+    fn restore_image(&mut self, image: &[u8]) -> Result<(), MemoryError> {
+        self.0.restore_image(image)
+    }
+
+    fn supports_cow_snapshot(&self) -> bool {
+        self.0.supports_cow_snapshot()
+    }
+
+    fn snapshot_cow(&self) -> Result<CowBacking, MemoryError> {
+        self.0.snapshot_cow()
+    }
+
+    fn restore_cow(&mut self, cow: &CowBacking) -> Result<(), MemoryError> {
+        self.0.restore_cow(cow)
     }
 
     /// Returns the memory style for this memory.
@@ -829,6 +932,157 @@ pub unsafe fn initialize_memory_with_data(
     }
 }
 
+/// A pristine copy-on-write snapshot of a linear memory's contents.
+///
+/// On Linux this is a `memfd` holding the snapshot image. Restoring re-maps the
+/// live memory `MAP_PRIVATE | MAP_FIXED` over the memfd, which atomically
+/// discards every dirtied (private) page and re-exposes the pristine image in a
+/// single syscall — no userspace copy, and the cost is independent of how much
+/// the run wrote. See [`LinearMemory::snapshot_cow`] / [`LinearMemory::restore_cow`].
+#[derive(Debug)]
+#[allow(dead_code)] // `snap_bytes`/`pages`/`base` are unused on non-Linux targets.
+pub struct CowBacking {
+    /// `memfd` holding the pristine snapshot image (Linux only).
+    #[cfg(target_os = "linux")]
+    fd: std::os::fd::OwnedFd,
+    /// Size of the snapshot image in bytes (a whole number of wasm pages).
+    snap_bytes: usize,
+    /// Logical size of the memory at snapshot time.
+    pages: Pages,
+    /// Base address the snapshot was captured at; CoW restore requires the live
+    /// memory's base to be unchanged (guaranteed for static-style memories,
+    /// whose reservation never moves on `memory.grow`).
+    base: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl WasmMmap {
+    /// Capture the current contents into a fresh `memfd`. Does not touch the
+    /// live mapping.
+    fn snapshot_cow(&self) -> Result<CowBacking, MemoryError> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let (base, snap_bytes) = unsafe {
+            let md = self.vm_memory_definition.as_ptr();
+            let md = md.as_ref();
+            (md.base, md.current_length)
+        };
+
+        let fd = unsafe {
+            let raw = libc::memfd_create(c"wasmer-instance-snapshot".as_ptr(), libc::MFD_CLOEXEC);
+            if raw < 0 {
+                return Err(MemoryError::Generic(format!(
+                    "memfd_create failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            OwnedFd::from_raw_fd(raw)
+        };
+
+        if snap_bytes > 0 {
+            if unsafe { libc::ftruncate(fd.as_raw_fd(), snap_bytes as libc::off_t) } != 0 {
+                return Err(MemoryError::Generic(format!(
+                    "ftruncate failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // Copy the live bytes into the memfd via a temporary shared mapping.
+            unsafe {
+                let dst = libc::mmap(
+                    std::ptr::null_mut(),
+                    snap_bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    0,
+                );
+                if dst == libc::MAP_FAILED {
+                    return Err(MemoryError::Generic(format!(
+                        "mmap(memfd) failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                std::ptr::copy_nonoverlapping(base, dst.cast::<u8>(), snap_bytes);
+                libc::munmap(dst, snap_bytes);
+            }
+        }
+
+        Ok(CowBacking {
+            fd,
+            snap_bytes,
+            pages: self.size,
+            base: base as usize,
+        })
+    }
+
+    /// Restore from a CoW backing: re-map the snapshot region `MAP_PRIVATE |
+    /// MAP_FIXED` over the memfd (discarding all dirtied pages), drop any pages
+    /// grown above the snapshot, then shrink the logical size back.
+    fn restore_cow(&mut self, cow: &CowBacking) -> Result<(), MemoryError> {
+        use std::os::fd::AsRawFd;
+
+        let (base, cur_bytes) = unsafe {
+            let md = self.vm_memory_definition.as_ptr();
+            let md = md.as_ref();
+            (md.base, md.current_length)
+        };
+
+        // CoW restore is only valid while the base is stable (static memories).
+        // A moved base means a dynamic realloc happened; refuse rather than map
+        // over the wrong address.
+        if base as usize != cow.base {
+            return Err(MemoryError::Generic(
+                "memory base moved since snapshot; cow restore is invalid".into(),
+            ));
+        }
+
+        if cow.snap_bytes > 0 {
+            let res = unsafe {
+                libc::mmap(
+                    base.cast::<libc::c_void>(),
+                    cow.snap_bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    cow.fd.as_raw_fd(),
+                    0,
+                )
+            };
+            if res == libc::MAP_FAILED {
+                return Err(MemoryError::Generic(format!(
+                    "MAP_FIXED cow remap failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        // Drop any pages the run grew above the snapshot, so a later grow sees
+        // zero-initialized memory (Wasm spec) and no prior-run data leaks.
+        if cur_bytes > cow.snap_bytes {
+            let rc = unsafe {
+                libc::madvise(
+                    base.add(cow.snap_bytes).cast::<libc::c_void>(),
+                    cur_bytes - cow.snap_bytes,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if rc != 0 {
+                return Err(MemoryError::Generic(format!(
+                    "madvise(MADV_DONTNEED) failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        // Shrink the logical view back to the snapshot size.
+        self.size = cow.pages;
+        unsafe {
+            let mut md = self.vm_memory_definition.as_ptr();
+            md.as_mut().current_length = cow.snap_bytes;
+        }
+        Ok(())
+    }
+}
+
 /// Represents memory that is used by the WebAssembly module
 pub trait LinearMemory
 where
@@ -861,6 +1115,56 @@ where
     fn reset(&mut self) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation {
             message: "reset() is not supported".to_string(),
+        })
+    }
+
+    /// Capture the current contents of this memory as a byte image.
+    ///
+    /// The image is exactly `current_length` bytes (a whole number of wasm
+    /// pages). Pair with [`LinearMemory::restore_image`] to snapshot and later
+    /// restore a warm instance's linear memory.
+    fn snapshot_image(&self) -> Vec<u8> {
+        unsafe {
+            let def = self.vmmemory().as_ref();
+            slice::from_raw_parts(def.base, def.current_length).to_vec()
+        }
+    }
+
+    /// Restore this memory's contents and logical size to a previously captured
+    /// [`snapshot_image`](LinearMemory::snapshot_image).
+    ///
+    /// After the call the memory is byte-for-byte equal to `image` and its
+    /// `current_length` equals `image.len()`. If the memory had grown past the
+    /// snapshot size, the excess pages are zeroed so a later `memory.grow`
+    /// observes zero-initialized memory, as the spec requires.
+    fn restore_image(&mut self, _image: &[u8]) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation {
+            message: "restore_image() is not supported".to_string(),
+        })
+    }
+
+    /// Whether this memory supports low-latency copy-on-write snapshots
+    /// ([`snapshot_cow`](LinearMemory::snapshot_cow)). When `false`, callers
+    /// fall back to the eager [`snapshot_image`](LinearMemory::snapshot_image)
+    /// path.
+    fn supports_cow_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Capture the current contents as a copy-on-write [`CowBacking`] for
+    /// O(dirty-pages) restore. Only call when
+    /// [`supports_cow_snapshot`](LinearMemory::supports_cow_snapshot) is `true`.
+    fn snapshot_cow(&self) -> Result<CowBacking, MemoryError> {
+        Err(MemoryError::UnsupportedOperation {
+            message: "snapshot_cow() is not supported".to_string(),
+        })
+    }
+
+    /// Restore this memory from a [`CowBacking`] captured by
+    /// [`snapshot_cow`](LinearMemory::snapshot_cow).
+    fn restore_cow(&mut self, _cow: &CowBacking) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation {
+            message: "restore_cow() is not supported".to_string(),
         })
     }
 

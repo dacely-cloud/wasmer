@@ -44,9 +44,9 @@ pub use crate::extern_ref::{VMExternObj, VMExternRef};
 pub use crate::function_env::VMFunctionEnvironment;
 pub use crate::global::*;
 pub use crate::imports::Imports;
-pub use crate::instance::{InstanceAllocator, VMInstance};
+pub use crate::instance::{InstanceAllocator, VMInstance, VMInstanceSnapshot};
 pub use crate::memory::{
-    LinearMemory, NotifyLocation, VMMemory, VMOwnedMemory, VMSharedMemory,
+    CowBacking, LinearMemory, NotifyLocation, VMMemory, VMOwnedMemory, VMSharedMemory,
     initialize_memory_with_data,
 };
 pub use crate::mmap::{Mmap, MmapType};
