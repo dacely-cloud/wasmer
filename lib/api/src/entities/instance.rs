@@ -175,6 +175,22 @@ impl Instance {
         }
     }
 
+    /// Capture a snapshot with an eager (memcpy) memory image, regardless of
+    /// copy-on-write support. Required for [`Instance::reset_to_snapshot_bounded`]
+    /// (which memcpys a prefix of the captured image). Only supported on `sys`.
+    #[cfg(feature = "sys")]
+    pub fn snapshot_eager(&self, store: &impl AsStoreRef) -> Result<InstanceSnapshot, RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => Ok(InstanceSnapshot {
+                inner: i.snapshot_eager(store),
+            }),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::snapshot_eager is only supported on the sys backend",
+            )),
+        }
+    }
+
     /// Restore this instance to a previously captured [`InstanceSnapshot`],
     /// undoing every memory/global/table mutation (and any `data.drop` /
     /// `elem.drop`) performed since the snapshot was taken.
@@ -193,6 +209,33 @@ impl Instance {
             #[allow(unreachable_patterns)]
             _ => Err(RuntimeError::new(
                 "Instance::reset_to_snapshot is only supported on the sys backend",
+            )),
+        }
+    }
+
+    /// Restore from an eager [`InstanceSnapshot`], copying each memory only over
+    /// its first `mem_dirty_bytes` (a plain `memcpy`, no page-table edits, so it
+    /// scales across cores — unlike the copy-on-write path). The caller
+    /// guarantees the tail `[mem_dirty_bytes, current_length)` is already at its
+    /// reset value (e.g. held zero by a soft guard). Globals, tables, and passive
+    /// segments are restored in full.
+    ///
+    /// The snapshot must be eager ([`Instance::snapshot_eager`]); a CoW snapshot
+    /// errors. Only supported on the `sys` backend.
+    #[cfg(feature = "sys")]
+    pub fn reset_to_snapshot_bounded(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &InstanceSnapshot,
+        mem_dirty_bytes: usize,
+    ) -> Result<(), RuntimeError> {
+        match &self._inner {
+            BackendInstance::Sys(i) => i
+                .reset_to_snapshot_bounded(store, &snapshot.inner, mem_dirty_bytes)
+                .map_err(|e| RuntimeError::new(e.to_string())),
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::new(
+                "Instance::reset_to_snapshot_bounded is only supported on the sys backend",
             )),
         }
     }

@@ -8,6 +8,10 @@
 
 use wasmer::{Instance, Memory, Module, Store, imports};
 
+/// Serializes the tests that depend on the global `WASMER_DISABLE_INSTANCE_COW`
+/// env var, so a parallel toggle can't make a CoW-specific assertion flaky.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A module that exposes a mutable global, a linear memory, and a funcref table,
 /// plus functions to mutate and observe each.
 const WAT: &str = r#"
@@ -548,7 +552,214 @@ fn cow_disabled_env_forces_eager_path() {
     // The escape hatch must still restore correctly (both paths are equivalent).
     // SAFETY: single-threaded within this test; other tests are correct under
     // either path, so transient visibility of the var does not affect them.
+    let _env = ENV_LOCK.lock().unwrap();
     unsafe { std::env::set_var("WASMER_DISABLE_INSTANCE_COW", "1") };
     assert_byte_exact_restore(WAT);
     unsafe { std::env::remove_var("WASMER_DISABLE_INSTANCE_COW") };
+}
+
+// ---------------------------------------------------------------------------
+// Bounded reset (`reset_to_snapshot_bounded`) — the clean-split fast path:
+// memcpy only the first `mem_dirty_bytes` of memory (caller owns the tail),
+// while globals/tables/passive are always restored in full.
+// ---------------------------------------------------------------------------
+
+/// Zero a memory's tail `[from, current)` — stands in for the embedder's guard
+/// (which `madvise`s/zeroes the region beyond the learned dirty bound).
+fn zero_tail(store: &Store, mem: &Memory, from: usize) {
+    let view = mem.view(store);
+    let len = view.data_size() as usize;
+    if len > from {
+        view.write(from as u64, &vec![0u8; len - from]).unwrap();
+    }
+}
+
+#[test]
+fn bounded_restore_only_touches_the_prefix() {
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let write = instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
+        .unwrap();
+    let read = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "read_byte")
+        .unwrap();
+
+    let snap = instance.snapshot_eager(&store).unwrap();
+    let k = 4096usize; // only [0, k) is restored by the API
+
+    write.call(&mut store, 100, 0xAA).unwrap(); // inside the bound
+    write.call(&mut store, 5000, 0xBB).unwrap(); // outside the bound
+
+    instance.reset_to_snapshot_bounded(&mut store, &snap, k).unwrap();
+
+    assert_eq!(read.call(&mut store, 100).unwrap(), 0, "prefix restored");
+    assert_eq!(
+        read.call(&mut store, 5000).unwrap(),
+        0xBB,
+        "tail is left untouched — the caller owns [k, current)"
+    );
+}
+
+#[test]
+fn bounded_restore_resets_globals_and_tables_in_full() {
+    // Memory is bounded, but globals + tables (+ passive) are always restored
+    // fully — even with k = 0.
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let exports = &instance.exports;
+    let set_g = exports.get_typed_function::<i32, ()>(&store, "set_g").unwrap();
+    let get_g = exports.get_typed_function::<(), i32>(&store, "get_g").unwrap();
+    let set_slot0 = exports
+        .get_typed_function::<(), ()>(&store, "set_slot0_f1")
+        .unwrap();
+    let call0 = exports.get_typed_function::<(), i32>(&store, "call0").unwrap();
+
+    let snap = instance.snapshot_eager(&store).unwrap();
+
+    set_g.call(&mut store, 999).unwrap();
+    set_slot0.call(&mut store).unwrap();
+    assert_eq!(get_g.call(&mut store).unwrap(), 999);
+    assert_eq!(call0.call(&mut store).unwrap(), 200);
+
+    instance.reset_to_snapshot_bounded(&mut store, &snap, 0).unwrap();
+
+    assert_eq!(get_g.call(&mut store).unwrap(), 7, "global fully reset");
+    assert_eq!(
+        call0.call(&mut store).unwrap(),
+        100,
+        "table fully reset, visible to call_indirect"
+    );
+}
+
+#[test]
+fn bounded_restore_requires_eager_snapshot() {
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+    // Eager snapshot -> bounded works.
+    let eager = instance.snapshot_eager(&store).unwrap();
+    assert!(
+        instance
+            .reset_to_snapshot_bounded(&mut store, &eager, 4096)
+            .is_ok()
+    );
+
+    // On Linux a default snapshot of a static memory is CoW -> bounded rejects
+    // it. Hold the env lock so a parallel toggle of WASMER_DISABLE_INSTANCE_COW
+    // can't turn the default snapshot eager underneath us.
+    #[cfg(target_os = "linux")]
+    {
+        let _env = ENV_LOCK.lock().unwrap();
+        let cow = instance.snapshot(&store).unwrap();
+        assert!(
+            instance
+                .reset_to_snapshot_bounded(&mut store, &cow, 4096)
+                .is_err(),
+            "bounded restore must reject a CoW snapshot"
+        );
+    }
+}
+
+#[test]
+fn bounded_matches_full_when_writes_stay_within_bound() {
+    // If the embedder's contract holds (no writes past the bound), bounded
+    // restore is byte-identical to a full restore.
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let mem = instance.exports.get_memory("mem").unwrap().clone();
+    let write = instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
+        .unwrap();
+
+    // Patterned non-zero baseline within the first 4 KiB.
+    let mut a = 0;
+    while a < 4096 {
+        write.call(&mut store, a, (a >> 3) & 0xff).unwrap();
+        a += 8;
+    }
+    let baseline = read_all(&store, &mem);
+
+    let eager = instance.snapshot_eager(&store).unwrap();
+    let mut a = 0;
+    while a < 4096 {
+        write.call(&mut store, a, 0xEE).unwrap();
+        a += 8;
+    }
+    instance
+        .reset_to_snapshot_bounded(&mut store, &eager, 4096)
+        .unwrap();
+
+    assert_eq!(
+        read_all(&store, &mem),
+        baseline,
+        "bounded restore is byte-exact within the bound"
+    );
+}
+
+#[test]
+fn bounded_restore_clamps_oversized_k() {
+    // k far beyond current_length must not read/write OOB.
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let write = instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
+        .unwrap();
+    let read = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "read_byte")
+        .unwrap();
+
+    let snap = instance.snapshot_eager(&store).unwrap();
+    write.call(&mut store, 100, 0x55).unwrap();
+    instance
+        .reset_to_snapshot_bounded(&mut store, &snap, 100 * 65536)
+        .unwrap(); // k ≫ 1 page
+    assert_eq!(
+        read.call(&mut store, 100).unwrap(),
+        0,
+        "clamped to the memory, restored, no OOB"
+    );
+}
+
+#[test]
+fn bounded_plus_guard_tail_is_leak_free_across_tenants() {
+    // The full toil-backend pattern, repeated: bounded restore over [0, k) via
+    // our API + the embedder zeroes the tail itself. No tenant byte survives in
+    // either region.
+    let mut store = Store::default();
+    let module = Module::new(&store, WAT).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let mem = instance.exports.get_memory("mem").unwrap().clone();
+    let write = instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
+        .unwrap();
+    let read = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "read_byte")
+        .unwrap();
+
+    let snap = instance.snapshot_eager(&store).unwrap();
+    let k = 4096usize;
+
+    for tenant in 0..5i32 {
+        write.call(&mut store, 10, 0xA0 | tenant).unwrap(); // secret in prefix
+        write.call(&mut store, 20000, 0xB0 | tenant).unwrap(); // secret in tail
+
+        instance.reset_to_snapshot_bounded(&mut store, &snap, k).unwrap();
+        zero_tail(&store, &mem, k); // the embedder's guard
+
+        assert_eq!(read.call(&mut store, 10).unwrap(), 0, "prefix leak @ tenant {tenant}");
+        assert_eq!(read.call(&mut store, 20000).unwrap(), 0, "tail leak @ tenant {tenant}");
+    }
 }

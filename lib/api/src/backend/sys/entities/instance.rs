@@ -119,6 +119,13 @@ impl Instance {
             .snapshot()
     }
 
+    /// Capture an eager (memcpy) snapshot for the bounded reset fast path.
+    pub(crate) fn snapshot_eager(&self, store: &impl AsStoreRef) -> VMInstanceSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot_eager()
+    }
+
     /// Restore this instance to a previously captured snapshot.
     pub(crate) fn reset_to_snapshot(
         &self,
@@ -128,6 +135,19 @@ impl Instance {
         self._handle
             .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
             .reset_to_snapshot(snapshot)
+    }
+
+    /// Restore from a snapshot, memcpy'ing each memory only over its first
+    /// `mem_dirty_bytes`. See [`wasmer_vm::VMInstance::reset_to_snapshot_bounded`].
+    pub(crate) fn reset_to_snapshot_bounded(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMInstanceSnapshot,
+        mem_dirty_bytes: usize,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_to_snapshot_bounded(snapshot, mem_dirty_bytes)
     }
 
     /// Capture a table-only snapshot (no memory/globals). See

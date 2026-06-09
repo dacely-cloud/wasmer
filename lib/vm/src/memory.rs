@@ -1143,6 +1143,25 @@ where
         })
     }
 
+    /// Restore only the first `bytes` of this memory from a captured `image`,
+    /// leaving the tail and the logical size untouched.
+    ///
+    /// This is the embedder-bounded fast path: the caller has learned the dirty
+    /// extent (e.g. via a `mincore`/`mprotect` guard) and guarantees the tail
+    /// `[bytes, current_length)` is already at its reset value, so only the
+    /// touched prefix needs copying. A plain `memcpy` — no page-table edits, no
+    /// TLB shootdown — so it scales across cores, unlike the CoW path.
+    fn restore_image_bounded(&mut self, image: &[u8], bytes: usize) -> Result<(), MemoryError> {
+        unsafe {
+            let def = self.vmmemory().as_ref();
+            let n = bytes.min(image.len()).min(def.current_length);
+            if n > 0 {
+                slice::from_raw_parts_mut(def.base, n).copy_from_slice(&image[..n]);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this memory supports low-latency copy-on-write snapshots
     /// ([`snapshot_cow`](LinearMemory::snapshot_cow)). When `false`, callers
     /// fall back to the eager [`snapshot_image`](LinearMemory::snapshot_image)

@@ -66,8 +66,19 @@ impl std::fmt::Debug for VMInstanceSnapshot {
 impl Instance {
     /// Capture this instance's defined memories, globals, and tables.
     pub(crate) fn snapshot(&self) -> VMInstanceSnapshot {
+        self.snapshot_with(!cow_disabled())
+    }
+
+    /// Capture with an eager (memcpy) memory image regardless of CoW support.
+    /// Required by [`restore_bounded`](Self::restore_bounded), which memcpys a
+    /// prefix of the image — a CoW/memfd snapshot has no in-process byte image
+    /// to slice.
+    pub(crate) fn snapshot_eager(&self) -> VMInstanceSnapshot {
+        self.snapshot_with(false)
+    }
+
+    fn snapshot_with(&self, allow_cow: bool) -> VMInstanceSnapshot {
         let ctx = self.context();
-        let allow_cow = !cow_disabled();
 
         let memories = self
             .memories
@@ -155,6 +166,60 @@ impl Instance {
         Ok(())
     }
 
+    /// Like [`restore`](Self::restore), but each memory is restored only over
+    /// its first `mem_dirty_bytes` (an embedder-supplied bound on the touched
+    /// extent), via a plain `memcpy` — no page-table edits, so it scales across
+    /// cores. The caller guarantees the tail `[mem_dirty_bytes, current_length)`
+    /// is already at its reset value (e.g. held zero by a soft guard). Globals,
+    /// tables, and passive segments are restored in full. Requires an eager
+    /// snapshot (see [`snapshot_eager`](Self::snapshot_eager)).
+    pub(crate) fn restore_bounded(
+        &mut self,
+        snap: &VMInstanceSnapshot,
+        mem_dirty_bytes: usize,
+    ) -> Result<(), MemoryError> {
+        if snap.memories.len() != self.memories.len()
+            || snap.globals.len() != self.globals.len()
+            || snap.tables.len() != self.tables.len()
+        {
+            return Err(MemoryError::Generic(
+                "snapshot does not match this instance's shape".into(),
+            ));
+        }
+
+        let memories: Vec<_> = self.memories.values().copied().collect();
+        let globals: Vec<_> = self.globals.values().copied().collect();
+
+        {
+            // SAFETY: see `restore`; single-threaded reset, no aliasing.
+            let ctx = unsafe { &mut *self.context };
+            for (h, mem_snap) in memories.iter().zip(&snap.memories) {
+                let mem = h.get_mut(ctx);
+                match mem_snap {
+                    MemorySnapshot::Eager(image) => {
+                        mem.restore_image_bounded(image, mem_dirty_bytes)?
+                    }
+                    MemorySnapshot::Cow(_) => {
+                        return Err(MemoryError::Generic(
+                            "restore_bounded requires an eager snapshot \
+                             (capture with snapshot_eager)"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            for (h, &val) in globals.iter().zip(&snap.globals) {
+                unsafe {
+                    (*h.get(ctx).vmglobal().as_ptr()).val.u128 = val;
+                }
+            }
+        }
+
+        self.restore_table_elements(&snap.tables);
+        self.reinitialize_passive_segments();
+        Ok(())
+    }
+
     /// Restore every defined table's raw elements, then re-sync the vmctx inline
     /// fixed-funcref arrays. `call_indirect` dispatches through those inline
     /// arrays, not the `VMTable` backing `vec`, so restoring the backing alone
@@ -224,12 +289,31 @@ impl VMInstance {
         self.instance().snapshot()
     }
 
+    /// Capture a snapshot with an eager (memcpy) memory image — required for the
+    /// bounded fast path [`VMInstance::reset_to_snapshot_bounded`].
+    pub fn snapshot_eager(&self) -> VMInstanceSnapshot {
+        self.instance().snapshot_eager()
+    }
+
     /// Restore this instance to a previously captured [`VMInstanceSnapshot`].
     ///
     /// Returns an error if the snapshot's shape does not match this instance, or
     /// if a memory could not be grown back to the snapshot size.
     pub fn reset_to_snapshot(&mut self, snapshot: &VMInstanceSnapshot) -> Result<(), MemoryError> {
         self.instance_mut().restore(snapshot)
+    }
+
+    /// Restore from a snapshot, copying each memory only over its first
+    /// `mem_dirty_bytes` (a `memcpy`, no page-table edits → scales across
+    /// cores). The caller guarantees the tail beyond that bound is already at
+    /// its reset value. Requires an eager snapshot
+    /// ([`VMInstance::snapshot_eager`]); errors on a CoW snapshot.
+    pub fn reset_to_snapshot_bounded(
+        &mut self,
+        snapshot: &VMInstanceSnapshot,
+        mem_dirty_bytes: usize,
+    ) -> Result<(), MemoryError> {
+        self.instance_mut().restore_bounded(snapshot, mem_dirty_bytes)
     }
 }
 
