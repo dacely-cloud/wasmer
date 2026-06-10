@@ -23,7 +23,12 @@ use crate::{CowBacking, LinearMemory, VMFuncRef};
 enum MemorySnapshot {
     /// Eager byte image (portable; used for dynamic memories, shared memories,
     /// non-Linux targets, or when a `memfd` could not be created).
-    Eager(Vec<u8>),
+    ///
+    /// `dirty_prefix` is the image's highest non-zero byte, so `image[dirty_prefix..]`
+    /// is all zero. The bounded restore copies only `[0, dirty_prefix)` and
+    /// zeroes the rest with cache-bypassing stores instead of streaming zeros
+    /// through the cache.
+    Eager { image: Vec<u8>, dirty_prefix: usize },
     /// Copy-on-write backing: restore re-maps the live memory over a `memfd`,
     /// discarding dirtied pages in a single syscall (O(dirty pages)).
     Cow(CowBacking),
@@ -94,7 +99,15 @@ impl Instance {
                 {
                     return MemorySnapshot::Cow(cow);
                 }
-                MemorySnapshot::Eager(mem.snapshot_image())
+                let image = mem.snapshot_image();
+                // Highest non-zero byte: everything above it is zero, so the
+                // bounded restore can zero that tail with non-temporal stores
+                // instead of copying it. Scanned once here, never per-reset.
+                let dirty_prefix = image.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                MemorySnapshot::Eager {
+                    image,
+                    dirty_prefix,
+                }
             })
             .collect();
 
@@ -145,7 +158,7 @@ impl Instance {
             for (h, mem_snap) in memories.iter().zip(&snap.memories) {
                 let mem = h.get_mut(ctx);
                 match mem_snap {
-                    MemorySnapshot::Eager(image) => mem.restore_image(image)?,
+                    MemorySnapshot::Eager { image, .. } => mem.restore_image(image)?,
                     MemorySnapshot::Cow(cow) => mem.restore_cow(cow)?,
                 }
             }
@@ -196,9 +209,10 @@ impl Instance {
             for (h, mem_snap) in memories.iter().zip(&snap.memories) {
                 let mem = h.get_mut(ctx);
                 match mem_snap {
-                    MemorySnapshot::Eager(image) => {
-                        mem.restore_image_bounded(image, mem_dirty_bytes)?
-                    }
+                    MemorySnapshot::Eager {
+                        image,
+                        dirty_prefix,
+                    } => mem.restore_image_bounded(image, *dirty_prefix, mem_dirty_bytes)?,
                     MemorySnapshot::Cow(_) => {
                         return Err(MemoryError::Generic(
                             "restore_bounded requires an eager snapshot \

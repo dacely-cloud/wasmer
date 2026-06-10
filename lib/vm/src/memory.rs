@@ -1083,6 +1083,50 @@ impl WasmMmap {
     }
 }
 
+/// Zero `[ptr, ptr + len)` with cache-bypassing non-temporal stores on x86_64
+/// (a normal `memset` elsewhere), ending with an `sfence` so the weakly-ordered
+/// streaming stores are globally visible before the memory is next read.
+///
+/// Used by [`LinearMemory::restore_image_bounded`] to stamp a tenant heap back
+/// to zero WITHOUT pulling those bytes through the CPU cache. Under concurrent
+/// load the embedder's hot working set (its poll loop, sockets, JIT code) is
+/// far more valuable than the just-written zeros; a temporal copy of tens of
+/// KiB of zeros evicts that working set and the resulting cache-miss stalls
+/// cost more than the copy itself.
+///
+/// # Safety
+/// `[ptr, ptr + len)` must be one valid, writable allocation.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_zero(mut ptr: *mut u8, mut len: usize) {
+    use core::arch::x86_64::{_mm_setzero_si128, _mm_sfence, _mm_stream_si128};
+    unsafe {
+        // Scalar until 16-byte aligned: `movntdq` requires an aligned address.
+        while len > 0 && (ptr as usize & 0xf) != 0 {
+            ptr.write(0);
+            ptr = ptr.add(1);
+            len -= 1;
+        }
+        let zero = _mm_setzero_si128();
+        while len >= 16 {
+            _mm_stream_si128(ptr.cast(), zero);
+            ptr = ptr.add(16);
+            len -= 16;
+        }
+        while len > 0 {
+            ptr.write(0);
+            ptr = ptr.add(1);
+            len -= 1;
+        }
+        // Order the non-temporal stores before any subsequent load of this range.
+        _mm_sfence();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn nt_zero(ptr: *mut u8, len: usize) {
+    unsafe { core::ptr::write_bytes(ptr, 0, len) }
+}
+
 /// Represents memory that is used by the WebAssembly module
 pub trait LinearMemory
 where
@@ -1143,20 +1187,47 @@ where
         })
     }
 
-    /// Restore only the first `bytes` of this memory from a captured `image`,
+    /// Restore this memory's first `zero_to` bytes from a captured `image`,
     /// leaving the tail and the logical size untouched.
     ///
     /// This is the embedder-bounded fast path: the caller has learned the dirty
     /// extent (e.g. via a `mincore`/`mprotect` guard) and guarantees the tail
-    /// `[bytes, current_length)` is already at its reset value, so only the
-    /// touched prefix needs copying. A plain `memcpy` — no page-table edits, no
-    /// TLB shootdown — so it scales across cores, unlike the CoW path.
-    fn restore_image_bounded(&mut self, image: &[u8], bytes: usize) -> Result<(), MemoryError> {
+    /// `[zero_to, current_length)` is already at its reset value, so only the
+    /// touched prefix needs restoring. No page-table edits and no TLB shootdown,
+    /// so it scales across cores, unlike the CoW path.
+    ///
+    /// The restore is split at `copy_prefix` (the image's highest non-zero byte,
+    /// supplied by the snapshot): `[0, copy_prefix)` is copied from `image` with
+    /// an ordinary temporal `memcpy`, and `[copy_prefix, zero_to)` — which the
+    /// image is all-zero over — is zeroed with cache-bypassing non-temporal
+    /// stores. For a tenant whose static data is a small low prefix and whose
+    /// dirtied heap is large, this keeps the bulk zero-fill out of the CPU cache
+    /// and preserves the embedder's hot working set under concurrent load.
+    fn restore_image_bounded(
+        &mut self,
+        image: &[u8],
+        copy_prefix: usize,
+        zero_to: usize,
+    ) -> Result<(), MemoryError> {
         unsafe {
             let def = self.vmmemory().as_ref();
-            let n = bytes.min(image.len()).min(def.current_length);
-            if n > 0 {
-                slice::from_raw_parts_mut(def.base, n).copy_from_slice(&image[..n]);
+            let zero_to = zero_to.min(image.len()).min(def.current_length);
+            let copy = copy_prefix.min(zero_to);
+            if copy > 0 {
+                slice::from_raw_parts_mut(def.base, copy).copy_from_slice(&image[..copy]);
+            }
+            // The snapshot sets `copy_prefix` to the image's highest non-zero
+            // byte, so `image[copy..zero_to]` is all zero and writing zeros there
+            // is byte-identical to copying the image — just cache-bypassing.
+            debug_assert!(
+                image
+                    .get(copy..zero_to.min(image.len()))
+                    .is_none_or(|s| s.iter().all(|&b| b == 0)),
+                "restore_image_bounded: image must be zero in [copy_prefix, zero_to)"
+            );
+            let zlen = zero_to - copy;
+            if zlen > 0 {
+                nt_zero(def.base.add(copy), zlen);
             }
         }
         Ok(())
