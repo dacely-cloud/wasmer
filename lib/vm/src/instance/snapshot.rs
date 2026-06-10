@@ -143,26 +143,23 @@ impl Instance {
             ));
         }
 
-        // Store handles are `Copy`; collect them up front so each `&mut
-        // StoreObjects` borrow below does not entangle with the borrow of
-        // `self`'s entity slices.
-        let memories: Vec<_> = self.memories.values().copied().collect();
-        let globals: Vec<_> = self.globals.values().copied().collect();
-
         {
             // SAFETY: `self.context` is valid for the instance's lifetime and is
             // not aliased while we hold this `&mut` (reset runs single-threaded
-            // between wasm calls).
+            // between wasm calls). The handle slices live in the instance, not
+            // in `*self.context`, so iterating them while mutating through
+            // `ctx` is disjoint — no intermediate `collect()` (restore runs
+            // per request; the Vecs were measurable allocator traffic).
             let ctx = unsafe { &mut *self.context };
 
-            for (h, mem_snap) in memories.iter().zip(&snap.memories) {
+            for (h, mem_snap) in self.memories.values().copied().zip(&snap.memories) {
                 let mem = h.get_mut(ctx);
                 match mem_snap {
                     MemorySnapshot::Eager { image, .. } => mem.restore_image(image)?,
                     MemorySnapshot::Cow(cow) => mem.restore_cow(cow)?,
                 }
             }
-            for (h, &val) in globals.iter().zip(&snap.globals) {
+            for (h, &val) in self.globals.values().copied().zip(&snap.globals) {
                 // Write through the raw definition pointer; it lives in the
                 // vmctx, not in the `&VMGlobal` borrow.
                 unsafe {
@@ -200,13 +197,13 @@ impl Instance {
             ));
         }
 
-        let memories: Vec<_> = self.memories.values().copied().collect();
-        let globals: Vec<_> = self.globals.values().copied().collect();
-
         {
-            // SAFETY: see `restore`; single-threaded reset, no aliasing.
+            // SAFETY: see `restore`; single-threaded reset, no aliasing, and
+            // the same disjointness argument for iterating the instance-owned
+            // handle slices while mutating through `ctx`. Hot path: no
+            // `collect()` allocations.
             let ctx = unsafe { &mut *self.context };
-            for (h, mem_snap) in memories.iter().zip(&snap.memories) {
+            for (h, mem_snap) in self.memories.values().copied().zip(&snap.memories) {
                 let mem = h.get_mut(ctx);
                 match mem_snap {
                     MemorySnapshot::Eager {
@@ -222,7 +219,7 @@ impl Instance {
                     }
                 }
             }
-            for (h, &val) in globals.iter().zip(&snap.globals) {
+            for (h, &val) in self.globals.values().copied().zip(&snap.globals) {
                 unsafe {
                     (*h.get(ctx).vmglobal().as_ptr()).val.u128 = val;
                 }
@@ -239,23 +236,29 @@ impl Instance {
     /// arrays, not the `VMTable` backing `vec`, so restoring the backing alone
     /// would leave a `table.set` mutation visible to indirect calls.
     fn restore_table_elements(&mut self, table_snaps: &[Vec<RawTableElement>]) {
-        let indices: Vec<_> = self.tables.keys().collect();
         {
             // SAFETY: see `restore`; single-threaded reset, no aliasing.
             let ctx = unsafe { &mut *self.context };
-            for (idx, elems) in indices.iter().zip(table_snaps) {
-                let handle = self.tables[*idx];
+            for (handle, elems) in self.tables.values().copied().zip(table_snaps) {
                 handle.get_mut(ctx).restore_elements(elems);
             }
         }
-        for idx in &indices {
-            self.sync_fixed_funcref_table(*idx);
+        // `sync_fixed_funcref_table` takes `&self`, so iterating the keys
+        // directly borrows cleanly — no index `collect()` on the hot path.
+        for idx in self.tables.keys() {
+            self.sync_fixed_funcref_table(idx);
         }
     }
 
     /// Reset the passive element and data segment maps back to the module's
     /// declared set, undoing any `elem.drop` / `data.drop` a run performed.
     fn reinitialize_passive_segments(&self) {
+        // Nothing declared means nothing a guest `elem.drop` / `data.drop`
+        // could have removed; skip the RefCell churn on the per-request
+        // reset path.
+        if self.module.passive_elements.is_empty() && self.module.passive_data.is_empty() {
+            return;
+        }
         {
             let mut passive_elements = self.passive_elements.borrow_mut();
             passive_elements.clear();
@@ -279,12 +282,15 @@ impl Instance {
         {
             let mut passive_data = self.passive_data.borrow_mut();
             passive_data.clear();
+            // By-reference: one `Arc::from(&[u8])` copy per segment. The old
+            // `self.module.passive_data.clone()` deep-copied every segment's
+            // `Box<[u8]>` and then `Arc::from(Box)` copied it AGAIN — two full
+            // byte copies of all passive data per reset.
             passive_data.extend(
                 self.module
                     .passive_data
-                    .clone()
-                    .into_iter()
-                    .map(|(idx, bytes)| (idx, Arc::from(bytes))),
+                    .iter()
+                    .map(|(&idx, bytes)| (idx, Arc::from(&bytes[..]))),
             );
         }
     }
