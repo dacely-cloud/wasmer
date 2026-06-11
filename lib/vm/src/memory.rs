@@ -1083,21 +1083,39 @@ impl WasmMmap {
     }
 }
 
-/// Zero `[ptr, ptr + len)` with cache-bypassing non-temporal stores on x86_64
-/// (a normal `memset` elsewhere), ending with an `sfence` so the weakly-ordered
-/// streaming stores are globally visible before the memory is next read.
+/// Extents at or below this zero with TEMPORAL stores (plain `memset`);
+/// only larger extents use the non-temporal path.
 ///
-/// Used by [`LinearMemory::restore_image_bounded`] to stamp a tenant heap back
-/// to zero WITHOUT pulling those bytes through the CPU cache. Under concurrent
-/// load the embedder's hot working set (its poll loop, sockets, JIT code) is
-/// far more valuable than the just-written zeros; a temporal copy of tens of
-/// KiB of zeros evicts that working set and the resulting cache-miss stalls
-/// cost more than the copy itself.
+/// Why a threshold: for a per-request instance reset, the zeroed span is
+/// the instance's OWN working set — the very bytes the next request
+/// rewrites. Temporal zeroing keeps those lines in L2 where the next
+/// request hits them warm and the DRAM bus sees only occasional
+/// write-backs. Non-temporal stores force EVERY byte to DRAM EVERY
+/// reset: measured at 707k req/s with an ~80 KiB dirty extent, that was
+/// ~55 GB/s of mandatory DRAM writes (5x the read traffic) — the
+/// memory bus, not the CPU, capped the whole server. NT still wins for
+/// huge extents (multi-MiB grown heaps) that would flush a core's
+/// entire L2 through the cache hierarchy.
+///
+/// 512 KiB = half a typical per-core L2: a hot extent up to this size
+/// stays resident between requests.
+const NT_ZERO_THRESHOLD: usize = 512 * 1024;
+
+/// Zero `[ptr, ptr + len)` — temporal `memset` up to
+/// [`NT_ZERO_THRESHOLD`], cache-bypassing non-temporal stores above it
+/// (x86_64; a normal `memset` elsewhere), ending with an `sfence` so the
+/// weakly-ordered streaming stores are globally visible before the
+/// memory is next read.
 ///
 /// # Safety
 /// `[ptr, ptr + len)` must be one valid, writable allocation.
 #[cfg(target_arch = "x86_64")]
 unsafe fn nt_zero(mut ptr: *mut u8, mut len: usize) {
+    if len <= NT_ZERO_THRESHOLD {
+        // Hot-extent fast path: stays in cache, off the DRAM bus.
+        unsafe { core::ptr::write_bytes(ptr, 0, len) };
+        return;
+    }
     use core::arch::x86_64::{_mm_setzero_si128, _mm_sfence, _mm_stream_si128};
     unsafe {
         // Scalar until 16-byte aligned: `movntdq` requires an aligned address.
