@@ -404,9 +404,9 @@ impl Mmap {
         self.total_size
     }
 
-    // Accessors used by `mmap_pool` to inspect this mapping when
-    // deciding whether and how to recycle it. Crate-private; the pool
-    // is the only code that has any business reading these directly.
+    // Accessors used by `mmap_pool` when returning an unpooled mapping to the OS.
+    // Crate-private; the pool is the only code that has any business reading these
+    // directly.
 
     #[cfg(target_os = "linux")]
     pub(crate) fn raw_ptr_for_pool(&self) -> usize {
@@ -414,23 +414,8 @@ impl Mmap {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn accessible_size_for_pool(&self) -> usize {
-        self.accessible_size
-    }
-
-    #[cfg(target_os = "linux")]
     pub(crate) fn total_size_for_pool(&self) -> usize {
         self.total_size
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn was_extended_for_pool(&self) -> bool {
-        self.extended_beyond_accessible
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn clear_extended_for_pool(&mut self) {
-        self.extended_beyond_accessible = false;
     }
 
     /// Return whether any memory has been allocated.
