@@ -333,7 +333,8 @@ impl VMInstance {
         snapshot: &VMInstanceSnapshot,
         mem_dirty_bytes: usize,
     ) -> Result<(), MemoryError> {
-        self.instance_mut().restore_bounded(snapshot, mem_dirty_bytes)
+        self.instance_mut()
+            .restore_bounded(snapshot, mem_dirty_bytes)
     }
 }
 

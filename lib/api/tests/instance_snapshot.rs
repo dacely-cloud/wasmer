@@ -58,16 +58,26 @@ fn table_reset_visible_to_call_indirect() {
     let module = Module::new(&store, WAT).unwrap();
     let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
     let exports = &instance.exports;
-    let call0 = exports.get_typed_function::<(), i32>(&store, "call0").unwrap();
+    let call0 = exports
+        .get_typed_function::<(), i32>(&store, "call0")
+        .unwrap();
     let set_slot0 = exports
         .get_typed_function::<(), ()>(&store, "set_slot0_f1")
         .unwrap();
 
     let snap = instance.snapshot(&store).unwrap();
-    assert_eq!(call0.call(&mut store).unwrap(), 100, "baseline: slot 0 = $f0");
+    assert_eq!(
+        call0.call(&mut store).unwrap(),
+        100,
+        "baseline: slot 0 = $f0"
+    );
 
     set_slot0.call(&mut store).unwrap();
-    assert_eq!(call0.call(&mut store).unwrap(), 200, "mutated: slot 0 = $f1");
+    assert_eq!(
+        call0.call(&mut store).unwrap(),
+        200,
+        "mutated: slot 0 = $f1"
+    );
 
     instance.reset_to_snapshot(&mut store, &snap).unwrap();
     assert_eq!(
@@ -90,10 +100,18 @@ fn snapshot_round_trip_memory_global_table() {
     let read = exports
         .get_typed_function::<i32, i32>(&store, "read_byte")
         .unwrap();
-    let set_g = exports.get_typed_function::<i32, ()>(&store, "set_g").unwrap();
-    let get_g = exports.get_typed_function::<(), i32>(&store, "get_g").unwrap();
-    let grow = exports.get_typed_function::<i32, i32>(&store, "grow").unwrap();
-    let size = exports.get_typed_function::<(), i32>(&store, "size").unwrap();
+    let set_g = exports
+        .get_typed_function::<i32, ()>(&store, "set_g")
+        .unwrap();
+    let get_g = exports
+        .get_typed_function::<(), i32>(&store, "get_g")
+        .unwrap();
+    let grow = exports
+        .get_typed_function::<i32, i32>(&store, "grow")
+        .unwrap();
+    let size = exports
+        .get_typed_function::<(), i32>(&store, "size")
+        .unwrap();
     let set_slot1 = exports
         .get_typed_function::<(), ()>(&store, "set_slot1")
         .unwrap();
@@ -148,7 +166,9 @@ fn grown_pages_are_zeroed_after_reset() {
     let read = exports
         .get_typed_function::<i32, i32>(&store, "read_byte")
         .unwrap();
-    let grow = exports.get_typed_function::<i32, i32>(&store, "grow").unwrap();
+    let grow = exports
+        .get_typed_function::<i32, i32>(&store, "grow")
+        .unwrap();
 
     let snap = instance.snapshot(&store).unwrap();
 
@@ -179,8 +199,12 @@ fn snapshot_isolation_across_reuses() {
     let read = exports
         .get_typed_function::<i32, i32>(&store, "read_byte")
         .unwrap();
-    let set_g = exports.get_typed_function::<i32, ()>(&store, "set_g").unwrap();
-    let get_g = exports.get_typed_function::<(), i32>(&store, "get_g").unwrap();
+    let set_g = exports
+        .get_typed_function::<i32, ()>(&store, "set_g")
+        .unwrap();
+    let get_g = exports
+        .get_typed_function::<(), i32>(&store, "get_g")
+        .unwrap();
 
     let snap = instance.snapshot(&store).unwrap();
 
@@ -225,7 +249,9 @@ fn reset_restores_dropped_passive_data() {
     let init_at = exports
         .get_typed_function::<i32, ()>(&store, "init_at")
         .unwrap();
-    let drop_d = exports.get_typed_function::<(), ()>(&store, "drop_d").unwrap();
+    let drop_d = exports
+        .get_typed_function::<(), ()>(&store, "drop_d")
+        .unwrap();
     let read = exports
         .get_typed_function::<i32, i32>(&store, "read_byte")
         .unwrap();
@@ -306,7 +332,11 @@ fn snapshot_captures_a_non_pristine_baseline() {
     write.call(&mut store, 8, 0xEE).unwrap();
 
     instance.reset_to_snapshot(&mut store, &snap).unwrap();
-    assert_eq!(get_g.call(&mut store).unwrap(), 50, "restored to snapshot, not init");
+    assert_eq!(
+        get_g.call(&mut store).unwrap(),
+        50,
+        "restored to snapshot, not init"
+    );
     assert_eq!(read.call(&mut store, 8).unwrap(), 0xCD);
 }
 
@@ -316,16 +346,24 @@ fn repeated_reset_loop_is_stable() {
     let module = Module::new(&store, WAT).unwrap();
     let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
     let exports = &instance.exports;
-    let set_g = exports.get_typed_function::<i32, ()>(&store, "set_g").unwrap();
-    let get_g = exports.get_typed_function::<(), i32>(&store, "get_g").unwrap();
+    let set_g = exports
+        .get_typed_function::<i32, ()>(&store, "set_g")
+        .unwrap();
+    let get_g = exports
+        .get_typed_function::<(), i32>(&store, "get_g")
+        .unwrap();
     let write = exports
         .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
         .unwrap();
     let read = exports
         .get_typed_function::<i32, i32>(&store, "read_byte")
         .unwrap();
-    let grow = exports.get_typed_function::<i32, i32>(&store, "grow").unwrap();
-    let size = exports.get_typed_function::<(), i32>(&store, "size").unwrap();
+    let grow = exports
+        .get_typed_function::<i32, i32>(&store, "grow")
+        .unwrap();
+    let size = exports
+        .get_typed_function::<(), i32>(&store, "size")
+        .unwrap();
     let set_slot1 = exports
         .get_typed_function::<(), ()>(&store, "set_slot1")
         .unwrap();
@@ -338,16 +376,26 @@ fn repeated_reset_loop_is_stable() {
     for i in 0..64i32 {
         // Mutate every kind of state with iteration-dependent values.
         set_g.call(&mut store, i.wrapping_mul(7) + 1).unwrap();
-        write.call(&mut store, (i % 100) * 4, (i & 0xff) as i32).unwrap();
+        write
+            .call(&mut store, (i % 100) * 4, (i & 0xff) as i32)
+            .unwrap();
         let _ = grow.call(&mut store, (i % 3) + 1).unwrap();
         set_slot1.call(&mut store).unwrap();
 
         instance.reset_to_snapshot(&mut store, &snap).unwrap();
 
         assert_eq!(get_g.call(&mut store).unwrap(), 7, "iter {i}: global");
-        assert_eq!(read.call(&mut store, (i % 100) * 4).unwrap(), 0, "iter {i}: mem");
+        assert_eq!(
+            read.call(&mut store, (i % 100) * 4).unwrap(),
+            0,
+            "iter {i}: mem"
+        );
         assert_eq!(size.call(&mut store).unwrap(), 1, "iter {i}: size");
-        assert_eq!(slot_is_null.call(&mut store, 1).unwrap(), 1, "iter {i}: table");
+        assert_eq!(
+            slot_is_null.call(&mut store, 1).unwrap(),
+            1,
+            "iter {i}: table"
+        );
     }
 }
 
@@ -370,10 +418,18 @@ fn restores_i64_and_f64_globals() {
     let module = Module::new(&store, WAT_TYPES).unwrap();
     let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
     let exports = &instance.exports;
-    let set_gi = exports.get_typed_function::<i64, ()>(&store, "set_gi").unwrap();
-    let get_gi = exports.get_typed_function::<(), i64>(&store, "get_gi").unwrap();
-    let set_gf = exports.get_typed_function::<f64, ()>(&store, "set_gf").unwrap();
-    let get_gf = exports.get_typed_function::<(), f64>(&store, "get_gf").unwrap();
+    let set_gi = exports
+        .get_typed_function::<i64, ()>(&store, "set_gi")
+        .unwrap();
+    let get_gi = exports
+        .get_typed_function::<(), i64>(&store, "get_gi")
+        .unwrap();
+    let set_gf = exports
+        .get_typed_function::<f64, ()>(&store, "set_gf")
+        .unwrap();
+    let get_gf = exports
+        .get_typed_function::<(), f64>(&store, "get_gf")
+        .unwrap();
 
     let snap = instance.snapshot(&store).unwrap();
 
@@ -501,8 +557,14 @@ fn assert_byte_exact_restore(wat: &str) {
         .exports
         .get_typed_function::<(i32, i32), ()>(&store, "write_byte")
         .unwrap();
-    let grow = instance.exports.get_typed_function::<i32, i32>(&store, "grow").unwrap();
-    let size = instance.exports.get_typed_function::<(), i32>(&store, "size").unwrap();
+    let grow = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "grow")
+        .unwrap();
+    let size = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "size")
+        .unwrap();
 
     // Patterned 3-page baseline.
     let _ = grow.call(&mut store, 2).unwrap();
@@ -531,8 +593,16 @@ fn assert_byte_exact_restore(wat: &str) {
 
     instance.reset_to_snapshot(&mut store, &snap).unwrap();
 
-    assert_eq!(size.call(&mut store).unwrap(), 3, "size restored to baseline");
-    assert_eq!(read_all(&store, &mem), baseline, "memory restored byte-for-byte");
+    assert_eq!(
+        size.call(&mut store).unwrap(),
+        3,
+        "size restored to baseline"
+    );
+    assert_eq!(
+        read_all(&store, &mem),
+        baseline,
+        "memory restored byte-for-byte"
+    );
 }
 
 #[test]
@@ -594,7 +664,9 @@ fn bounded_restore_only_touches_the_prefix() {
     write.call(&mut store, 100, 0xAA).unwrap(); // inside the bound
     write.call(&mut store, 5000, 0xBB).unwrap(); // outside the bound
 
-    instance.reset_to_snapshot_bounded(&mut store, &snap, k).unwrap();
+    instance
+        .reset_to_snapshot_bounded(&mut store, &snap, k)
+        .unwrap();
 
     assert_eq!(read.call(&mut store, 100).unwrap(), 0, "prefix restored");
     assert_eq!(
@@ -612,12 +684,18 @@ fn bounded_restore_resets_globals_and_tables_in_full() {
     let module = Module::new(&store, WAT).unwrap();
     let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
     let exports = &instance.exports;
-    let set_g = exports.get_typed_function::<i32, ()>(&store, "set_g").unwrap();
-    let get_g = exports.get_typed_function::<(), i32>(&store, "get_g").unwrap();
+    let set_g = exports
+        .get_typed_function::<i32, ()>(&store, "set_g")
+        .unwrap();
+    let get_g = exports
+        .get_typed_function::<(), i32>(&store, "get_g")
+        .unwrap();
     let set_slot0 = exports
         .get_typed_function::<(), ()>(&store, "set_slot0_f1")
         .unwrap();
-    let call0 = exports.get_typed_function::<(), i32>(&store, "call0").unwrap();
+    let call0 = exports
+        .get_typed_function::<(), i32>(&store, "call0")
+        .unwrap();
 
     let snap = instance.snapshot_eager(&store).unwrap();
 
@@ -626,7 +704,9 @@ fn bounded_restore_resets_globals_and_tables_in_full() {
     assert_eq!(get_g.call(&mut store).unwrap(), 999);
     assert_eq!(call0.call(&mut store).unwrap(), 200);
 
-    instance.reset_to_snapshot_bounded(&mut store, &snap, 0).unwrap();
+    instance
+        .reset_to_snapshot_bounded(&mut store, &snap, 0)
+        .unwrap();
 
     assert_eq!(get_g.call(&mut store).unwrap(), 7, "global fully reset");
     assert_eq!(
@@ -756,10 +836,20 @@ fn bounded_plus_guard_tail_is_leak_free_across_tenants() {
         write.call(&mut store, 10, 0xA0 | tenant).unwrap(); // secret in prefix
         write.call(&mut store, 20000, 0xB0 | tenant).unwrap(); // secret in tail
 
-        instance.reset_to_snapshot_bounded(&mut store, &snap, k).unwrap();
+        instance
+            .reset_to_snapshot_bounded(&mut store, &snap, k)
+            .unwrap();
         zero_tail(&store, &mem, k); // the embedder's guard
 
-        assert_eq!(read.call(&mut store, 10).unwrap(), 0, "prefix leak @ tenant {tenant}");
-        assert_eq!(read.call(&mut store, 20000).unwrap(), 0, "tail leak @ tenant {tenant}");
+        assert_eq!(
+            read.call(&mut store, 10).unwrap(),
+            0,
+            "prefix leak @ tenant {tenant}"
+        );
+        assert_eq!(
+            read.call(&mut store, 20000).unwrap(),
+            0,
+            "tail leak @ tenant {tenant}"
+        );
     }
 }

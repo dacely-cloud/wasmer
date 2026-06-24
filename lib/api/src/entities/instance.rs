@@ -1,9 +1,9 @@
+#[cfg(feature = "sys")]
+use crate::store::AsStoreRef;
 use crate::{
     Extern, RuntimeError, error::InstantiationError, exports::Exports, imports::Imports,
     macros::backend::gen_rt_ty, module::Module, store::AsStoreMut,
 };
-#[cfg(feature = "sys")]
-use crate::store::AsStoreRef;
 
 /// A WebAssembly Instance is a stateful, executable
 /// instance of a WebAssembly [`Module`].
@@ -179,7 +179,10 @@ impl Instance {
     /// copy-on-write support. Required for [`Instance::reset_to_snapshot_bounded`]
     /// (which memcpys a prefix of the captured image). Only supported on `sys`.
     #[cfg(feature = "sys")]
-    pub fn snapshot_eager(&self, store: &impl AsStoreRef) -> Result<InstanceSnapshot, RuntimeError> {
+    pub fn snapshot_eager(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Result<InstanceSnapshot, RuntimeError> {
         match &self._inner {
             BackendInstance::Sys(i) => Ok(InstanceSnapshot {
                 inner: i.snapshot_eager(store),
