@@ -1717,6 +1717,31 @@ pub async fn get_package(
         .map(|x| x.get_package)
 }
 
+/// Retrieve the published version numbers of a package, if it exists.
+///
+/// Returns `None` when the package does not exist in the registry, and an
+/// (possibly empty) list of version strings otherwise.
+pub async fn get_package_version_numbers(
+    client: &WasmerClient,
+    name: String,
+) -> Result<Option<Vec<String>>, anyhow::Error> {
+    let package = client
+        .run_graphql_strict(types::GetPackageVersionNumbers::build(
+            types::GetPackageVars { name },
+        ))
+        .await?
+        .get_package;
+
+    Ok(package.map(|p| {
+        p.versions
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .map(|v| v.version)
+            .collect()
+    }))
+}
+
 /// Retrieve a package version by its name.
 pub async fn get_package_version(
     client: &WasmerClient,
@@ -2314,6 +2339,52 @@ pub async fn purge_cache_for_app_version(
         .context("backend did not return data")?;
 
     Ok(())
+}
+
+pub async fn configure_app_cdn_cache(
+    client: &WasmerClient,
+    vars: types::ConfigureAppCdnCacheVars,
+) -> Result<types::AppCdnCacheMutationPayload, anyhow::Error> {
+    client
+        .run_graphql_strict(types::ConfigureAppCdnCache::build(vars))
+        .await
+        .map(|x| x.configure_app_cdn_cache)
+}
+
+pub async fn purge_app_cdn_cache(
+    client: &WasmerClient,
+    vars: types::PurgeAppCdnCacheVars,
+) -> Result<types::AppCdnCacheMutationPayload, anyhow::Error> {
+    client
+        .run_graphql_strict(types::PurgeAppCdnCache::build(vars))
+        .await
+        .map(|x| x.purge_app_cdn_cache)
+}
+
+pub async fn app_cdn_cache_status(
+    client: &WasmerClient,
+    vars: types::GetAppCdnCacheStatusVars,
+) -> Result<types::AppCdnCacheStatus, anyhow::Error> {
+    client
+        .run_graphql_strict(types::GetAppCdnCacheStatus::build(vars))
+        .await?
+        .app
+        .context("app not found")?
+        .into_app()
+        .context("invalid node type returned")
+}
+
+pub async fn app_cdn_cache_metrics(
+    client: &WasmerClient,
+    vars: types::GetAppCdnCacheMetricsVars,
+) -> Result<types::AppCdnCacheMetrics, anyhow::Error> {
+    client
+        .run_graphql_strict(types::GetAppCdnCacheMetrics::build(vars))
+        .await?
+        .app
+        .context("app not found")?
+        .into_app()
+        .context("invalid node type returned")
 }
 
 /// Convert a [`OffsetDateTime`] to a unix timestamp that the WAPM backend
