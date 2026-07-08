@@ -1140,7 +1140,76 @@ unsafe fn nt_zero(mut ptr: *mut u8, mut len: usize) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// aarch64 counterpart of the x86_64 `nt_zero`: a temporal `memset` up to
+/// [`NT_ZERO_THRESHOLD`] (glibc's aarch64 `memset` already uses `DC ZVA` for
+/// the bulk, so the small-extent path is efficient), and cache-bypassing
+/// non-temporal stores above it, ending with a `DMB` so the weakly-ordered
+/// streamed stores are visible before the memory is next read.
+///
+/// The large-extent path uses `STNP` (store-pair non-temporal) of the zero
+/// register — the direct analogue of the x86 `_mm_stream_si128` loop. We
+/// deliberately do NOT use `DC ZVA` here: DC ZVA *allocates* the zeroed lines
+/// into the cache, which would evict the embedder's hot working set, defeating
+/// the whole purpose of this path (keeping the bulk zero-fill off the cache
+/// and the DRAM bus under concurrent load — see [`restore_image_bounded`]).
+/// STNP hints the memory system that the streamed zeros are non-temporal, so
+/// the working set survives, exactly as the x86 non-temporal path intends.
+///
+/// # Safety
+/// `[ptr, ptr + len)` must be one valid, writable allocation.
+#[cfg(target_arch = "aarch64")]
+unsafe fn nt_zero(mut ptr: *mut u8, mut len: usize) {
+    if len <= NT_ZERO_THRESHOLD {
+        // Hot-extent fast path: stays in cache, off the DRAM bus.
+        unsafe { core::ptr::write_bytes(ptr, 0, len) };
+        return;
+    }
+    unsafe {
+        // Scalar until 16-byte aligned: STNP is issued on a 16-byte pair; an
+        // aligned base keeps every store within a single cache line.
+        while len > 0 && (ptr as usize & 0xf) != 0 {
+            ptr.write(0);
+            ptr = ptr.add(1);
+            len -= 1;
+        }
+        // Bulk: 64 B/iter (a cache line) of non-temporal zero stores. `xzr`
+        // is the architectural zero register, so no FP/SIMD register is
+        // clobbered and no vector zero needs materializing.
+        while len >= 64 {
+            core::arch::asm!(
+                "stnp xzr, xzr, [{p}]",
+                "stnp xzr, xzr, [{p}, #16]",
+                "stnp xzr, xzr, [{p}, #32]",
+                "stnp xzr, xzr, [{p}, #48]",
+                p = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+            ptr = ptr.add(64);
+            len -= 64;
+        }
+        while len >= 16 {
+            core::arch::asm!(
+                "stnp xzr, xzr, [{p}]",
+                p = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+            ptr = ptr.add(16);
+            len -= 16;
+        }
+        while len > 0 {
+            ptr.write(0);
+            ptr = ptr.add(1);
+            len -= 1;
+        }
+        // Order the non-temporal stores before any subsequent access to this
+        // range — the analogue of the x86 `_mm_sfence`. A full Inner-Shareable
+        // `DMB` covers both same-thread reuse next request and the `--bg-reset`
+        // SPSC Release handoff of the instance to another core.
+        core::arch::asm!("dmb ish", options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn nt_zero(ptr: *mut u8, len: usize) {
     unsafe { core::ptr::write_bytes(ptr, 0, len) }
 }
