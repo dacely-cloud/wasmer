@@ -282,15 +282,18 @@ impl Instance {
         {
             let mut passive_data = self.passive_data.borrow_mut();
             passive_data.clear();
-            // By-reference: one `Arc::from(&[u8])` copy per segment. The old
-            // `self.module.passive_data.clone()` deep-copied every segment's
-            // `Box<[u8]>` and then `Arc::from(Box)` copied it AGAIN — two full
-            // byte copies of all passive data per reset.
+            // Upstream now shares module passive data as `Arc<[u8]>` (#6776),
+            // and the instance tracks each segment as `Option<Arc<[u8]>>`
+            // (`None` once `data.drop` has run). Restoring the baseline is then
+            // a pure refcount bump per segment (`Arc::clone`) wrapped in `Some`
+            // -- zero byte copies. (The prior fork code did one `Arc::from(&[u8])`
+            // copy per segment; before that, `module.passive_data.clone()` did
+            // two full copies.)
             passive_data.extend(
                 self.module
                     .passive_data
                     .iter()
-                    .map(|(&idx, bytes)| (idx, Arc::from(&bytes[..]))),
+                    .map(|(&idx, bytes)| (idx, Some(Arc::clone(bytes)))),
             );
         }
     }
