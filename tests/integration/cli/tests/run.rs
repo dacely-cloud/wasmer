@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use wasmer_integration_tests_cli::{
     asset_path,
     fixtures::{self, packages, php, resources},
-    wasmer_command,
+    integration_webc_path, wasmer_command,
 };
 
 static RUST_LOG: Lazy<String> = Lazy::new(|| {
@@ -168,6 +168,27 @@ fn run_wasi_works() {
         .arg("--")
         .arg("-e")
         .arg("print(3 * (4 + 5))")
+        .assert()
+        .success();
+
+    assert.stdout("27\n");
+}
+
+/// See <https://github.com/wasmerio/wasmer/issues/6835>. Needs a WASI module:
+/// `fixtures::fib()` imports nothing, so it never reaches the WASI runner.
+#[cfg(unix)]
+#[test]
+fn issue_6835_run_wasi_forwards_non_utf8_host_env() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let assert = wasmer_command()
+        .arg("run")
+        .arg("--forward-host-env")
+        .arg(fixtures::qjs())
+        .arg("--")
+        .arg("-e")
+        .arg("print(3 * (4 + 5))")
+        .env("WASMER_TEST_NON_UTF8", OsStr::from_bytes(b"V\xffW"))
         .assert()
         .success();
 
@@ -637,6 +658,23 @@ fn local_package_fs_mounts_work_for_dir_and_webc() {
         .success();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn wasmer_run_wasix_wasm_c_api_guest() {
+    let temp = TempDir::new().unwrap();
+    let wasm = temp.path().join("wasix-wasm-c-api-smoke.wasm");
+
+    compile_wasix_source(&fixtures::wasix_wasm_c_api_smoke_c(), &wasm, false);
+
+    wasmer_command()
+        .arg("run")
+        .arg(&wasm)
+        .env("RUST_LOG", &*RUST_LOG)
+        .assert()
+        .success()
+        .stdout(contains("wasm-c-api ok"));
+}
+
 #[test]
 // The test would be very slow on Windows and macOS
 #[cfg_attr(any(target_os = "windows", target_os = "macos"), ignore)]
@@ -687,6 +725,21 @@ fn wasi_runner_on_disk_with_dependencies() {
 }
 
 #[test]
+fn webc_v2_emits_a_deprecation_warning() {
+    let webc = integration_webc_path()
+        .join("static-web-server-async-1.0.3-5d739d1a-20b7-4edf-8cf4-44e813f96b25.webc");
+
+    wasmer_command()
+        .arg("run")
+        .arg(webc)
+        .arg("--")
+        .arg("--help")
+        .assert()
+        .success()
+        .stderr(contains("WebC v2 is a deprecated format"));
+}
+
+#[test]
 fn webc_files_on_disk_with_multiple_commands_require_an_entrypoint_flag() {
     let assert = wasmer_command()
         .arg("run")
@@ -727,8 +780,6 @@ fn issue_3794_unable_to_mount_relative_paths() {
 
     let assert = wasmer_command()
         .arg("run")
-        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
-        .arg("--llvm")
         .arg("wasmer/bash")
         .arg("--entrypoint=bash")
         .arg(format!("--volume={}:./some-dir/", temp.path().display()))
@@ -748,21 +799,17 @@ fn issue_3794_unable_to_mount_relative_paths() {
 fn merged_filesystem_contains_all_files() {
     let assert = wasmer_command()
         .arg("run")
-        .arg("wasmer/bash")
-        .arg("--entrypoint=bash")
         .arg("--use")
+        .arg("wasmer/bash")
         .arg("python/python")
-        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
-        .arg("--llvm")
         .arg("--")
         .arg("-c")
-        .arg("ls -l /usr/local/lib/python3.13/*.py")
-        .env("RUST_LOG", &*RUST_LOG)
+        .arg("import this")
         .assert();
 
     assert
         .success()
-        .stdout(contains("/usr/local/lib/python3.13/this.py"));
+        .stdout(contains("Beautiful is better than ugly."));
 }
 
 #[test]
@@ -805,8 +852,8 @@ fn error_if_no_start_function_found() {
 
 #[test]
 #[cfg_attr(
-    feature = "v8",
-    ignore = "wasmer using a c_api backend only may not have the 'compile' command"
+    any(feature = "v8", target_os = "windows"),
+    ignore = "wasmer may not have the 'compile' command with this backend"
 )]
 fn run_a_pre_compiled_wasm_file() {
     let temp = TempDir::new().unwrap();
@@ -893,8 +940,6 @@ fn run_bash_using_coreutils() {
     let assert = wasmer_command()
         .arg("run")
         .arg("wasmer/bash")
-        // TODO: drop once #6419 gets implemented (EH support for Cranelift on macOS)
-        .arg("--llvm")
         .arg("--entrypoint=bash")
         .arg("--use=wasmer/coreutils")
         .arg("--registry=wasmer.io")

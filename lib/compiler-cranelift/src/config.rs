@@ -11,9 +11,9 @@ use std::{
     sync::Arc,
 };
 use std::{num::NonZero, path::PathBuf};
-use target_lexicon::OperatingSystem;
+use target_lexicon::{OperatingSystem, Vendor};
 use wasmer_compiler::{
-    Compiler, CompilerConfig, Engine, EngineBuilder, ModuleMiddleware,
+    Compiler, CompilerConfig, Debugger, Engine, EngineBuilder, ModuleMiddleware,
     misc::{CompiledKind, function_kind_to_filename, save_assembly_to_file},
 };
 use wasmer_types::{
@@ -33,6 +33,11 @@ impl CraneliftCallbacks {
         // Create the debug dir in case it doesn't exist
         std::fs::create_dir_all(&debug_dir)?;
         Ok(Self { debug_dir })
+    }
+
+    /// Returns the debug directory where the debug files are written.
+    pub fn debug_dir(&self) -> &PathBuf {
+        &self.debug_dir
     }
 
     fn base_path(&self, module_hash: &Option<String>) -> PathBuf {
@@ -105,12 +110,14 @@ pub enum CraneliftOptLevel {
 /// consumed by `wasmer_engine::Engine::new`.
 #[derive(Debug, Clone)]
 pub struct Cranelift {
-    enable_nan_canonicalization: bool,
+    pub(crate) enable_nan_canonicalization: bool,
     pub(crate) allow_experimental_unaligned_memory_accesses: bool,
     enable_verifier: bool,
     pub(crate) enable_perfmap: bool,
-    enable_pic: bool,
-    opt_level: CraneliftOptLevel,
+    pub(crate) debugger: Option<Debugger>,
+    pub(crate) enable_pic: bool,
+    pub(crate) experimental_artifact: bool,
+    pub(crate) opt_level: CraneliftOptLevel,
     /// The number of threads to use for compilation.
     pub num_threads: NonZero<usize>,
     /// The middleware chain.
@@ -128,11 +135,19 @@ impl Cranelift {
             enable_verifier: false,
             opt_level: CraneliftOptLevel::Speed,
             enable_pic: false,
+            experimental_artifact: false,
             num_threads: std::thread::available_parallelism().unwrap_or(NonZero::new(1).unwrap()),
             middlewares: vec![],
             enable_perfmap: false,
+            debugger: None,
             callbacks: None,
         }
+    }
+
+    /// Enable the experimental artifact format.
+    pub fn experimental_artifact(&mut self, enable: bool) -> &mut Self {
+        self.experimental_artifact = enable;
+        self
     }
 
     /// Enable NaN canonicalization.
@@ -218,11 +233,11 @@ impl Cranelift {
             builder.enable("has_lzcnt").expect("should be valid flag");
         }
 
-        builder.finish(self.flags())
+        builder.finish(self.flags(target))
     }
 
     /// Generates the flags for the compiler
-    pub fn flags(&self) -> settings::Flags {
+    pub fn flags(&self, target: &Target) -> settings::Flags {
         let mut flags = settings::builder();
 
         // Enable probestack
@@ -244,11 +259,12 @@ impl Cranelift {
             .enable("use_colocated_libcalls")
             .expect("should be a valid flag");
 
-        // Allow Cranelift to implicitly spill multi-value returns via a hidden
-        // StructReturn argument when register results are exhausted.
-        flags
-            .enable("enable_multi_ret_implicit_sret")
-            .expect("should be a valid flag");
+        if matches!(target.triple().operating_system, OperatingSystem::Windows) {
+            // For macOS and Linux we rely on the precise `ReturnAbi` calling conventions.
+            flags
+                .enable("enable_multi_ret_implicit_sret")
+                .expect("should be a valid flag");
+        }
 
         // Invert cranelift's default-on verification to instead default off.
         flags
@@ -273,6 +289,12 @@ impl Cranelift {
             )
             .expect("should be valid flag");
 
+        if matches!(target.triple().vendor, Vendor::Apple) {
+            flags
+                .enable("enable_compact_unwind_abi")
+                .expect("should be valid flag");
+        }
+
         settings::Flags::new(flags)
     }
 
@@ -285,6 +307,10 @@ impl Cranelift {
 }
 
 impl CompilerConfig for Cranelift {
+    fn experimental_artifact(&mut self, enable: bool) {
+        self.experimental_artifact = enable;
+    }
+
     fn enable_pic(&mut self) {
         self.enable_pic = true;
     }
@@ -295,6 +321,10 @@ impl CompilerConfig for Cranelift {
 
     fn enable_perfmap(&mut self) {
         self.enable_perfmap = true;
+    }
+
+    fn enable_debugger(&mut self, debugger: Debugger) {
+        self.debugger = Some(debugger);
     }
 
     fn enable_experimental_unaligned_memory_accesses(&mut self) {
@@ -317,9 +347,14 @@ impl CompilerConfig for Cranelift {
 
     fn supported_features_for_target(&self, target: &Target) -> wasmer_types::Features {
         let mut feats = Features::default();
-        if target.triple().operating_system == OperatingSystem::Linux {
+
+        if matches!(
+            target.triple().operating_system,
+            OperatingSystem::Linux | OperatingSystem::Darwin(_)
+        ) {
             feats.exceptions(true);
         }
+        feats.exceptions(true);
         feats.relaxed_simd(true);
         feats.wide_arithmetic(true);
         feats

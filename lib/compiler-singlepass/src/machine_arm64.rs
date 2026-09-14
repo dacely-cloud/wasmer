@@ -15,7 +15,8 @@ use wasmer_compiler::{
     wasmparser::MemArg,
 };
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode,
+    TrapInformation, VMOffsets,
     target::{CallingConvention, CpuFeature, Target},
 };
 
@@ -1339,6 +1340,8 @@ impl Machine for MachineARM64 {
     type GPR = GPR;
     type SIMD = NEON;
 
+    const STACK_ALIGNMENT: usize = 16;
+
     fn assembler_get_offset(&self) -> Offset {
         self.assembler.get_offset()
     }
@@ -1557,10 +1560,6 @@ impl Machine for MachineARM64 {
         self.instructions_address_map.clone()
     }
 
-    fn round_stack_adjust(&self, value: usize) -> usize {
-        value.next_multiple_of(16)
-    }
-
     fn local_on_stack(&mut self, stack_offset: i32) -> Location {
         Location::Memory(GPR::X29, -stack_offset)
     }
@@ -1686,11 +1685,7 @@ impl Machine for MachineARM64 {
         Ok(())
     }
 
-    fn list_to_save(&self, _calling_convention: CallingConvention) -> Vec<Location> {
-        vec![]
-    }
-
-    fn get_param_registers(&self, _calling_convention: CallingConvention) -> &'static [Self::GPR] {
+    fn get_param_registers(&self) -> &'static [Self::GPR] {
         &[
             GPR::X0,
             GPR::X1,
@@ -1710,7 +1705,7 @@ impl Machine for MachineARM64 {
         stack_args: &mut usize,
         calling_convention: CallingConvention,
     ) -> Location {
-        let register_params = self.get_param_registers(calling_convention);
+        let register_params = self.get_param_registers();
         match calling_convention {
             CallingConvention::AppleAarch64 => register_params.get(idx).map_or_else(
                 || {
@@ -1743,7 +1738,7 @@ impl Machine for MachineARM64 {
         stack_args: &mut usize,
         calling_convention: CallingConvention,
     ) -> Location {
-        let register_params = self.get_param_registers(calling_convention);
+        let register_params = self.get_param_registers();
         let return_values_memory_size =
             8 * return_slots.saturating_sub(ARM64_RETURN_VALUE_REGISTERS.len()) as i32;
 
@@ -1776,12 +1771,8 @@ impl Machine for MachineARM64 {
         }
     }
 
-    fn get_simple_param_location(
-        &self,
-        idx: usize,
-        calling_convention: CallingConvention,
-    ) -> Self::GPR {
-        self.get_param_registers(calling_convention)[idx]
+    fn get_simple_param_location(&self, idx: usize) -> Self::GPR {
+        self.get_param_registers()[idx]
     }
 
     fn adjust_gpr_param_location(
@@ -1796,7 +1787,6 @@ impl Machine for MachineARM64 {
         &self,
         idx: usize,
         stack_location: &mut usize,
-        _calling_convention: CallingConvention,
     ) -> AbstractLocation<Self::GPR, Self::SIMD> {
         ARM64_RETURN_VALUE_REGISTERS.get(idx).map_or_else(
             || {
@@ -1811,7 +1801,6 @@ impl Machine for MachineARM64 {
     fn get_call_return_value_location(
         &self,
         idx: usize,
-        _calling_convention: CallingConvention,
     ) -> AbstractLocation<Self::GPR, Self::SIMD> {
         ARM64_RETURN_VALUE_REGISTERS.get(idx).map_or_else(
             || {
@@ -4684,7 +4673,6 @@ impl Machine for MachineARM64 {
 
     fn emit_call_with_reloc(
         &mut self,
-        _calling_convention: CallingConvention,
         reloc_target: RelocationTarget,
     ) -> Result<Vec<Relocation>, CompileError> {
         let mut relocations = vec![];
@@ -8384,8 +8372,9 @@ impl Machine for MachineARM64 {
         &self,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_trampoline_arm64(sig, calling_convention)
+        gen_std_trampoline_arm64(sig, calling_convention, progress_callback)
     }
     // Generates dynamic import function call trampoline for a function type.
 
@@ -8394,8 +8383,14 @@ impl Machine for MachineARM64 {
         vmoffsets: &VMOffsets,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_dynamic_import_trampoline_arm64(vmoffsets, sig, calling_convention)
+        gen_std_dynamic_import_trampoline_arm64(
+            vmoffsets,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
     // Singlepass calls import functions through a trampoline.
 
@@ -8405,8 +8400,15 @@ impl Machine for MachineARM64 {
         index: FunctionIndex,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<CustomSection, CompileError> {
-        gen_import_call_trampoline_arm64(vmoffsets, index, sig, calling_convention)
+        gen_import_call_trampoline_arm64(
+            vmoffsets,
+            index,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
 
     #[cfg(feature = "unwind")]

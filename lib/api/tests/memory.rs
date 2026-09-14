@@ -70,6 +70,10 @@ fn test_shared_memory_atomics_notify_send() {
 
 #[cfg(feature = "sys")]
 #[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "shared memory atomics are not supported by the default v8 backend"
+)]
 fn test_shared_memory_disable_atomics() {
     use wasmer::AtomicsError;
 
@@ -131,6 +135,19 @@ fn test_wasm_slice_issue_5444() {
         access.err(),
         Some(wasmer::MemoryAccessError::UnalignedPointerRead)
     ))
+}
+
+#[test]
+fn test_wasm_slice_new_rejects_out_of_bounds_ranges() {
+    let mut store = Store::default();
+    let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), false)).unwrap();
+    let view = memory.view(&store);
+
+    let slice = wasmer::WasmSlice::<u64>::new(&view, 0, 8193);
+    assert!(matches!(
+        slice.err(),
+        Some(wasmer::MemoryAccessError::HeapOutOfBounds)
+    ));
 }
 
 #[test]

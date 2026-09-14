@@ -50,10 +50,13 @@ pub fn sock_connect<M: MemorySize>(
 
 fn nonblocking_connect_result(status: crate::net::socket::WasiSocketStatus) -> Result<(), Errno> {
     match status {
-        crate::net::socket::WasiSocketStatus::Opening => Err(Errno::Inprogress),
+        // This is called immediately after initiating a nonblocking connect.
+        // A failure observed here is asynchronous and must remain available
+        // via SO_ERROR, so report EINPROGRESS rather than consume it.
+        crate::net::socket::WasiSocketStatus::Opening
+        | crate::net::socket::WasiSocketStatus::Closed
+        | crate::net::socket::WasiSocketStatus::Failed => Err(Errno::Inprogress),
         crate::net::socket::WasiSocketStatus::Opened => Ok(()),
-        crate::net::socket::WasiSocketStatus::Closed
-        | crate::net::socket::WasiSocketStatus::Failed => Err(Errno::Notconn),
     }
 }
 
@@ -75,11 +78,9 @@ pub(crate) fn sock_connect_internal(
         Rights::SOCK_CONNECT,
         move |mut socket, flags| async move {
             // Auto-bind UDP
-            socket = socket
-                .auto_bind_udp(tasks.deref(), net.deref())
-                .await?
-                .unwrap_or(socket);
-            socket
+            let bound_socket = socket.auto_bind_udp(tasks.deref(), net.deref()).await?;
+            socket = bound_socket.clone().unwrap_or(socket);
+            let connected_socket = socket
                 .connect(
                     tasks.deref(),
                     net.deref(),
@@ -87,7 +88,8 @@ pub(crate) fn sock_connect_internal(
                     None,
                     flags.contains(Fdflags::NONBLOCK),
                 )
-                .await
+                .await?;
+            Ok(connected_socket.or(bound_socket))
         }
     ));
 
@@ -117,11 +119,11 @@ mod tests {
         assert_eq!(nonblocking_connect_result(WasiSocketStatus::Opened), Ok(()));
         assert_eq!(
             nonblocking_connect_result(WasiSocketStatus::Failed),
-            Err(Errno::Notconn)
+            Err(Errno::Inprogress)
         );
         assert_eq!(
             nonblocking_connect_result(WasiSocketStatus::Closed),
-            Err(Errno::Notconn)
+            Err(Errno::Inprogress)
         );
     }
 }

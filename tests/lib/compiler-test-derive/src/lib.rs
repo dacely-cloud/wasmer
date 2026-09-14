@@ -56,10 +56,21 @@ fn compiler_test_impl(attrs: TokenStream, input: TokenStream) -> TokenStream {
     let construct_engine_test = |func: &::syn::ItemFn,
                                  compiler_name: &str,
                                  engine_name: &str,
-                                 engine_feature_name: &str|
+                                 engine_feature_name: &str,
+                                 experimental_artifact: bool,
+                                 dynamic_memory: bool|
      -> ::proc_macro2::TokenStream {
         let config_compiler = ::quote::format_ident!("{}", compiler_name);
         let test_name = ::quote::format_ident!("{}", engine_name.to_lowercase());
+        let mut config = quote! { crate::Config::new(crate::Compiler::#config_compiler) };
+        if experimental_artifact {
+            config = quote! { #config.with_experimental_artifact() };
+        }
+        if dynamic_memory {
+            config = quote! { #config.with_dynamic_memory() };
+        }
+        let experimental_artifact_cfg =
+            experimental_artifact.then(|| quote! { #[cfg(target_os = "linux")] });
         let mut new_sig = func.sig.clone();
         let attrs = func
             .attrs
@@ -72,8 +83,9 @@ fn compiler_test_impl(attrs: TokenStream, input: TokenStream) -> TokenStream {
             #[test_log::test]
             #attrs
             #[cfg(feature = #engine_feature_name)]
+            #experimental_artifact_cfg
             #new_sig {
-                #fn_name(crate::Config::new(crate::Compiler::#config_compiler))
+                #fn_name(#config)
             }
         };
         if should_ignore(
@@ -99,7 +111,30 @@ fn compiler_test_impl(attrs: TokenStream, input: TokenStream) -> TokenStream {
                 compiler_name,
                 compiler_name,
                 &compiler_name.to_lowercase(),
+                false,
+                false,
             );
+            let native_compiler = compiler_name != "V8";
+            let experimental_artifact_test = native_compiler.then(|| {
+                construct_engine_test(
+                    func,
+                    compiler_name,
+                    &format!("{compiler_name}_exp_artifact"),
+                    &compiler_name.to_lowercase(),
+                    true,
+                    false,
+                )
+            });
+            let dynamic_memory_experimental_artifact_test = native_compiler.then(|| {
+                construct_engine_test(
+                    func,
+                    compiler_name,
+                    &format!("{compiler_name}_dynamic_memory_exp_artifact"),
+                    &compiler_name.to_lowercase(),
+                    true,
+                    true,
+                )
+            });
             let compiler_name_lowercase = compiler_name.to_lowercase();
 
             quote! {
@@ -108,6 +143,8 @@ fn compiler_test_impl(attrs: TokenStream, input: TokenStream) -> TokenStream {
                     use super::*;
 
                     #engine_test
+                    #experimental_artifact_test
+                    #dynamic_memory_experimental_artifact_test
                 }
             }
         };

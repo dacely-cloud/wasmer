@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -159,7 +160,7 @@ impl CommonWasiOptions {
         }
 
         if self.forward_host_env {
-            builder.add_envs(std::env::vars());
+            builder.add_envs(os_env_vars(std::env::vars_os()));
         }
 
         builder.add_envs(self.env.clone());
@@ -176,6 +177,17 @@ impl CommonWasiOptions {
 
 // type ContainerFs =
 //     OverlayFileSystem<TmpFileSystem, [RelativeOrAbsolutePathHack<Arc<dyn FileSystem>>; 1]>;
+
+/// Turn host environment variables into raw byte pairs.
+///
+/// [`std::env::vars`] panics on entries that are not valid UTF-8, while both
+/// unix and WASI environment variables are byte strings.
+fn os_env_vars(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+    vars.into_iter()
+        .map(|(name, value)| (name.into_encoded_bytes(), value.into_encoded_bytes()))
+}
 
 fn normalized_mount_path(guest_path: &str) -> Result<PathBuf, Error> {
     let mut guest_path = PathBuf::from(guest_path);
@@ -393,14 +405,15 @@ pub struct MappedDirectory {
 
 impl From<MappedDirectory> for MountedDirectory {
     fn from(value: MappedDirectory) -> Self {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "host-fs")] {
+        cfg_select! {
+            feature = "host-fs" => {
                 let MappedDirectory { host, guest } = value;
                 let fs: Arc<dyn FileSystem + Send + Sync> =
                     Arc::new(virtual_fs::host_fs::FileSystem::new(Handle::current(), host).unwrap());
 
                 MountedDirectory { guest, fs }
-            } else {
+            }
+            _ => {
                 unreachable!("The `host-fs` feature needs to be enabled to map {value:?}")
             }
         }
@@ -423,6 +436,35 @@ mod tests {
 
     use super::*;
 
+    /// See <https://github.com/wasmerio/wasmer/issues/6835>.
+    #[cfg(unix)]
+    #[test]
+    fn issue_6835_non_utf8_host_env_vars_are_forwarded_as_raw_bytes() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let vars = [
+            (
+                OsStr::from_bytes(b"VALID").to_os_string(),
+                OsStr::from_bytes(b"ok").to_os_string(),
+            ),
+            (
+                OsStr::from_bytes(b"INVALID").to_os_string(),
+                OsStr::from_bytes(b"V\xffW").to_os_string(),
+            ),
+        ];
+
+        let mut builder = WasiEnvBuilder::new("test");
+        builder.add_envs(os_env_vars(vars));
+
+        assert_eq!(
+            builder.get_env(),
+            [
+                ("VALID".to_string(), b"ok".to_vec()),
+                ("INVALID".to_string(), b"V\xffW".to_vec()),
+            ]
+        );
+    }
+
     fn base_root(root_fs: &MountFileSystem) -> Arc<dyn FileSystem + Send + Sync> {
         root_fs.filesystem_at(Path::new("/")).unwrap()
     }
@@ -432,7 +474,7 @@ mod tests {
     }
 
     const PYTHON: &[u8] =
-        include_bytes!("../../../../wasmer-test-files/examples/python-0.1.0.wasmer");
+        include_bytes!("../../../../wasmer-test-files/examples/python--python@3.13.5.webc");
 
     #[derive(Debug)]
     struct CountingLimiter {
@@ -502,9 +544,12 @@ mod tests {
     #[tokio::test]
     async fn mix_env_vars_from_the_webc_and_user() {
         let args = CommonWasiOptions {
-            env: vec![("EXTRA".to_string(), "envs".to_string())]
-                .into_iter()
-                .collect(),
+            env: vec![
+                ("EXTRA".to_string(), "envs".to_string()),
+                ("HARD_CODED".to_string(), "user-override".to_string()),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         let mut builder = WasiEnvBuilder::new("python");
@@ -517,7 +562,7 @@ mod tests {
         assert_eq!(
             builder.get_env(),
             [
-                ("HARD_CODED".to_string(), b"env-vars".to_vec()),
+                ("HARD_CODED".to_string(), b"user-override".to_vec()),
                 ("EXTRA".to_string(), b"envs".to_vec()),
             ]
         );
@@ -558,12 +603,12 @@ mod tests {
         assert!(fs.metadata("/home/file.txt".as_ref()).unwrap().is_file());
         assert!(fs.metadata("lib".as_ref()).unwrap().is_dir());
         assert!(
-            fs.metadata("lib/python3.6/collections/__init__.py".as_ref())
+            fs.metadata("lib/python3.13/collections/__init__.py".as_ref())
                 .unwrap()
                 .is_file()
         );
         assert!(
-            fs.metadata("lib/python3.6/encodings/__init__.py".as_ref())
+            fs.metadata("lib/python3.13/encodings/__init__.py".as_ref())
                 .unwrap()
                 .is_file()
         );
@@ -604,7 +649,7 @@ mod tests {
                 .is_file()
         );
         assert!(
-            fs.metadata(Path::new("/python/lib/python3.6/collections/__init__.py"))
+            fs.metadata(Path::new("/python/lib/python3.13/collections/__init__.py"))
                 .unwrap()
                 .is_file()
         );
@@ -633,14 +678,14 @@ mod tests {
         .unwrap();
 
         fs.create_symlink(
-            Path::new("lib/python3.6/collections"),
+            Path::new("lib/python3.13/collections"),
             Path::new("/python/collections-link"),
         )
         .unwrap();
 
         assert_eq!(
             fs.readlink(Path::new("/python/collections-link")).unwrap(),
-            Path::new("lib/python3.6/collections")
+            Path::new("lib/python3.13/collections")
         );
         assert!(
             fs.symlink_metadata(Path::new("/python/collections-link"))

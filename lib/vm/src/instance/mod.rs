@@ -7,6 +7,9 @@
 //! how it is allocated and deallocated.
 
 mod allocator;
+mod snapshot;
+
+pub use self::snapshot::{VMInstanceSnapshot, VMTablesSnapshot};
 
 use crate::LinearMemory;
 use crate::imports::Imports;
@@ -17,14 +20,15 @@ use crate::vmcontext::{
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionContext,
     VMFunctionImport, VMFunctionKind, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition,
     VMMemoryImport, VMSharedTagIndex, VMSignatureHash, VMTableDefinition, VMTableImport,
-    VMTrampoline, memory_copy, memory_fill, memory32_atomic_check32, memory32_atomic_check64,
+    VMTrampoline, memory_copy, memory_fill, memory32_atomic_check_notify, memory32_atomic_check32,
+    memory32_atomic_check64,
 };
 use crate::{FunctionBodyPtr, MaybeInstanceOwned, TrapHandlerFn, VMTag, wasmer_call_trampoline};
 use crate::{VMConfig, VMFuncRef, VMFunction, VMGlobal, VMMemory, VMTable};
 use crate::{export::VMExtern, threadconditions::ExpectedValue};
 pub use allocator::InstanceAllocator;
+use core::mem::offset_of;
 use itertools::Itertools;
-use memoffset::offset_of;
 use more_asserts::assert_lt;
 use std::alloc::Layout;
 use std::cell::RefCell;
@@ -83,9 +87,15 @@ pub(crate) struct Instance {
     /// entries get removed.
     passive_elements: RefCell<HashMap<ElemIndex, Box<[Option<VMFuncRef>]>>>,
 
-    /// Passive data segments from our module. As `data.drop`s happen, entries
-    /// get removed. A missing entry is considered equivalent to an empty slice.
-    passive_data: RefCell<HashMap<DataIndex, Arc<[u8]>>>,
+    /// Per-instance view of the module's passive data segments.
+    ///
+    /// A `None` entry (dropped) or a missing entry is treated as an empty slice.
+    ///
+    /// The bytes are shared with the module via `Arc` (no per-instance copy).
+    /// `data.drop` replaces an entry's value with `None` to mark the segment
+    /// unusable for subsequent `memory.init` on this instance, without
+    /// affecting the shared module bytes or any other instance.
+    passive_data: RefCell<HashMap<DataIndex, Option<Arc<[u8]>>>>,
 
     /// Mapping of function indices to their func ref backing data. `VMFuncRef`s
     /// will point to elements here for functions defined by this instance.
@@ -265,7 +275,6 @@ impl Instance {
         }
     }
 
-    #[allow(dead_code)]
     /// Get a locally defined or imported memory.
     fn get_memory(&self, index: MemoryIndex) -> VMMemoryDefinition {
         if let Some(local_index) = self.module.local_memory_index(index) {
@@ -772,38 +781,24 @@ impl Instance {
         // dropping a non-passive element is a no-op (not a trap).
     }
 
-    /// Do a `memory.copy` for a locally defined memory.
+    /// Perform a `memory.copy` between two memories.
     ///
     /// # Errors
     ///
-    /// Returns a `Trap` error when the source or destination ranges are out of
+    /// Returns a `Trap` error when the source or destination range is out of
     /// bounds.
-    pub(crate) fn local_memory_copy(
+    pub(crate) fn memory_copy(
         &self,
-        memory_index: LocalMemoryIndex,
+        dst_memory_index: MemoryIndex,
+        src_memory_index: MemoryIndex,
         dst: u32,
         src: u32,
         len: u32,
     ) -> Result<(), Trap> {
-        // https://webassembly.github.io/reference-types/core/exec/instructions.html#exec-memory-copy
-
-        let memory = self.memory(memory_index);
-        // The following memory copy is not synchronized and is not atomic:
-        unsafe { memory_copy(&memory, dst, src, len) }
-    }
-
-    /// Perform a `memory.copy` on an imported memory.
-    pub(crate) fn imported_memory_copy(
-        &self,
-        memory_index: MemoryIndex,
-        dst: u32,
-        src: u32,
-        len: u32,
-    ) -> Result<(), Trap> {
-        let import = self.imported_memory(memory_index);
-        let memory = unsafe { import.definition.as_ref() };
-        // The following memory copy is not synchronized and is not atomic:
-        unsafe { memory_copy(memory, dst, src, len) }
+        let dst_memory = self.get_memory(dst_memory_index);
+        let src_memory = self.get_memory(src_memory_index);
+        // The following memory copy is not synchronized and is not atomic.
+        unsafe { memory_copy(&dst_memory, &src_memory, dst, src, len) }
     }
 
     /// Perform the `memory.fill` operation on a locally defined memory.
@@ -860,7 +855,13 @@ impl Instance {
 
         let memory = self.get_vmmemory(memory_index);
         let passive_data = self.passive_data.borrow();
-        let data = passive_data.get(&data_index).map_or(&[][..], |d| &**d);
+        // A missing entry (never existed) or a dropped one (`None`) both behave
+        // as a zero-length segment, so an in-bounds `memory.init` of non-zero
+        // length traps below.
+        let data = passive_data
+            .get(&data_index)
+            .and_then(|d| d.as_deref())
+            .unwrap_or(&[]);
 
         let current_length = unsafe { memory.vmmemory().as_ref().current_length };
         if src.checked_add(len).is_none_or(|n| n as usize > data.len())
@@ -877,7 +878,11 @@ impl Instance {
     /// Drop the given data segment, truncating its length to zero.
     pub(crate) fn data_drop(&self, data_index: DataIndex) {
         let mut passive_data = self.passive_data.borrow_mut();
-        passive_data.remove(&data_index);
+        // Release this instance's reference to the shared bytes and mark the
+        // segment unusable. Other instances (and the module) are unaffected.
+        if let Some(slot) = passive_data.get_mut(&data_index) {
+            *slot = None;
+        }
     }
 
     /// Get a table by index regardless of whether it is locally-defined or an
@@ -1056,6 +1061,8 @@ impl Instance {
         dst: u32,
         count: u32,
     ) -> Result<u32, Trap> {
+        let memory = self.memory(memory_index);
+        memory32_atomic_check_notify(&memory, dst)?;
         let memory = self.get_local_vmmemory_mut(memory_index);
         Ok(memory.do_notify(dst, count))
     }
@@ -1067,6 +1074,9 @@ impl Instance {
         dst: u32,
         count: u32,
     ) -> Result<u32, Trap> {
+        let import = self.imported_memory(memory_index);
+        let memory = unsafe { import.definition.as_ref() };
+        memory32_atomic_check_notify(memory, dst)?;
         let memory = self.get_vmmemory_mut(memory_index);
         Ok(memory.do_notify(dst, count))
     }
@@ -1151,12 +1161,13 @@ impl VMInstance {
                 .map(|m: &InternalStoreHandle<VMTag>| VMSharedTagIndex::new(m.index() as u32))
                 .collect::<PrimaryMap<TagIndex, VMSharedTagIndex>>()
                 .into_boxed_slice();
+            // Share the module's passive data bytes via `Arc` (refcount bump)
+            // rather than deep-copying them into every instance.
             let passive_data = RefCell::new(
                 module
                     .passive_data
-                    .clone()
-                    .into_iter()
-                    .map(|(idx, bytes)| (idx, Arc::from(bytes)))
+                    .iter()
+                    .map(|(&idx, bytes)| (idx, Some(Arc::clone(bytes))))
                     .collect::<HashMap<_, _>>(),
             );
 

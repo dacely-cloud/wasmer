@@ -1,4 +1,4 @@
-#![cfg(feature = "experimental-async")]
+#![cfg(all(feature = "experimental-async", not(target_arch = "wasm32")))]
 
 use std::{cell::RefCell, sync::OnceLock};
 
@@ -31,6 +31,10 @@ fn jspi_module() -> &'static [u8] {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
 fn async_state_updates_follow_jspi_example() -> Result<()> {
     let wasm = jspi_module();
     let mut store = Store::default();
@@ -116,6 +120,10 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
 fn typed_async_host_and_calls_work() -> Result<()> {
     let wasm = wat::parse_str(
         r#"
@@ -180,6 +188,75 @@ fn typed_async_host_and_calls_work() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "sys")]
+fn pooled_typed_async_host_and_calls_work() -> Result<()> {
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (import "host" "async_add" (func $async_add (param i32 i32) (result i32)))
+          (import "host" "async_double" (func $async_double (param i32) (result i32)))
+          (func (export "compute") (param i32) (result i32)
+            local.get 0
+            i32.const 10
+            call $async_add
+            local.get 0
+            call $async_double
+            i32.add))
+        "#,
+    )?;
+
+    #[derive(Clone, Copy)]
+    struct AddBias {
+        bias: i32,
+    }
+
+    let mut store = Store::default();
+    let module = Module::new(&store, wasm)?;
+
+    let add_env = FunctionEnv::new(&mut store, AddBias { bias: 5 });
+    let async_add = Function::new_typed_with_env_async(
+        &mut store,
+        &add_env,
+        async move |env: AsyncFunctionEnvMut<AddBias>, a: i32, b: i32| {
+            let env_read = env.read().await;
+            let bias = env_read.data().bias;
+            tokio::task::yield_now().await;
+            a + b + bias
+        },
+    );
+    let async_double = Function::new_typed_async(&mut store, async move |value: i32| {
+        tokio::task::yield_now().await;
+        value * 2
+    });
+
+    let import_object = imports! {
+        "host" => {
+            "async_add" => async_add,
+            "async_double" => async_double,
+        }
+    };
+
+    let instance = Instance::new(&mut store, &module, &import_object)?;
+    let compute: TypedFunction<i32, i32> =
+        instance.exports.get_typed_function(&store, "compute")?;
+
+    let store_async = store.into_async();
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(compute.call_async_typed(&store_async, 4))?;
+    assert_eq!(result, 27);
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
 fn cannot_yield_when_not_in_async_context() -> Result<()> {
     const WAT: &str = r#"
     (module
@@ -229,6 +306,10 @@ fn cannot_yield_when_not_in_async_context() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
 fn nested_async_in_sync() -> Result<()> {
     const WAT: &str = r#"
     (module

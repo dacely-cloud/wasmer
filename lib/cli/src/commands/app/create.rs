@@ -285,7 +285,7 @@ impl CmdAppCreate {
         let ask_confirmation = || {
             eprintln!(
                 "A package manifest was found in path {}.",
-                &manifest_path.display()
+                manifest_path.display()
             );
             let theme = dialoguer::theme::ColorfulTheme::default();
             Confirm::with_theme(&theme)
@@ -751,7 +751,9 @@ impl CmdAppCreate {
                 m.shift_remove("app_id");
             };
 
-            let raw_app = serde_yaml::to_string(&raw_yaml)?;
+            // Apply the edits onto the template's original text so its
+            // comments and formatting are preserved.
+            let raw_app = crate::utils::yaml::apply_app_config_to_yaml(&contents, &raw_yaml)?;
 
             // Validate..
             AppConfigV1::parse_yaml(&raw_app)?;
@@ -766,11 +768,11 @@ impl CmdAppCreate {
         if build_md_path.exists() {
             let contents = tokio::fs::read_to_string(build_md_path).await?;
             eprintln!(
-                "{}: {} 
+                "{}: {}
 {}",
                 "NOTE".bold(),
                 "The selected template has a `BUILD.md` file.
-This means there are likely additional build 
+This means there are likely additional build
 steps that you need to perform before deploying
 the app:\n"
                     .bold(),
@@ -825,6 +827,7 @@ the app:\n"
                 publish_package: !build_remote,
                 dir: self.app_dir_path.clone(),
                 path: path.map(|v| v.to_path_buf()),
+                env_file: None,
                 no_wait: self.no_wait,
                 no_default: false,
                 no_persist_id: false,

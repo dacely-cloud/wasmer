@@ -1,7 +1,7 @@
 [package]
 name = "wasmer-types"
 description = "Wasmer Common Types"
-categories = ["wasm", "no-std", "data-structures"]
+categories = ["wasm", "data-structures"]
 keywords = ["wasm", "webassembly", "types"]
 license = "MIT OR Apache-2.0 WITH LLVM-exception"
 readme = "README.md"
@@ -37,7 +37,6 @@ workspace = true
 features = ["wasm_js"]
 
 [dev-dependencies]
-memoffset.workspace = true
 criterion.workspace = true
 
 [[bench]]

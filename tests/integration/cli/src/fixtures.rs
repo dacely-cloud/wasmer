@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{asset_path, c_asset_path, integration_wasm_path, integration_webc_path};
+use crate::{asset_path, c_asset_path, integration_wasm_c_api_path, integration_wasm_path};
 
 pub fn resources() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("resources")
@@ -28,17 +28,6 @@ pub fn python() -> PathBuf {
     c_asset_path().join("python--python@3.13.5.webc")
 }
 
-/// A WEBC file containing bash.
-pub fn bash() -> PathBuf {
-    integration_webc_path().join("bash-1.0.16-f097441a-a80b-4e0d-87d7-684918ef4bb6.webc")
-}
-
-/// A WEBC file containing `wat2wasm`, `wasm-validate`, and other helpful
-/// WebAssembly-related commands.
-pub fn wabt() -> PathBuf {
-    c_asset_path().join("wabt-1.0.37.wasmer")
-}
-
 /// The QuickJS interpreter, compiled to a WASI module.
 pub fn qjs() -> PathBuf {
     c_asset_path().join("qjs.wasm")
@@ -57,4 +46,9 @@ pub fn fib() -> PathBuf {
 /// A `*.wat` file with no `_start()` function.
 pub fn wat_no_start() -> PathBuf {
     asset_path().join("no_start.wat")
+}
+
+/// C source for a WASIX guest that imports and calls `wasm_c_api_v0`.
+pub fn wasix_wasm_c_api_smoke_c() -> PathBuf {
+    integration_wasm_c_api_path().join("wasix-wasm-c-api-smoke.c")
 }

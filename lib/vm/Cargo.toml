@@ -13,14 +13,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-memoffset.workspace = true
 dashmap.workspace = true
-wasmer-types = { path = "../types", version = "=7.2.0-alpha.3" }
+wasmer-types = { path = "../types", version = "=7.4.0" }
 libc.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
 more-asserts.workspace = true
-cfg-if.workspace = true
 backtrace.workspace = true
 serde = { workspace = true, features = ["derive", "rc"], optional = true }
 enum-iterator.workspace = true
@@ -54,6 +52,13 @@ windows-sys = { workspace = true, features = [
 [build-dependencies]
 cc.workspace = true
 rustversion.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "mmap_pool_alloc"
+harness = false
 
 [badges]
 maintenance = { status = "actively-developed" }

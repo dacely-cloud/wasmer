@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::io::{self, Write};
-use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,6 +7,7 @@ use std::task::{Context, Poll};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
+use wasmer_wasix::PluggableRuntime;
 use wasmer_wasix::VirtualFile as VirtualFileTrait;
 use wasmer_wasix::runners::MappedDirectory;
 use wasmer_wasix::runners::wasi::{RuntimeOrEngine, WasiRunner};
@@ -15,6 +15,7 @@ use wasmer_wasix::runtime::module_cache::{HashedModuleData, ModuleCache};
 use wasmer_wasix::virtual_fs::{AsyncRead, AsyncSeek, AsyncWrite};
 
 use crate::Engine;
+use crate::error::exit_code_from_error;
 
 static TRACE_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
 static TRACE_CAPTURE_STATE: OnceLock<TraceCaptureState> = OnceLock::new();
@@ -263,6 +264,7 @@ fn create_engine_for_wasm(wasm_bytes: &[u8], engine: Engine) -> wasmer::Engine {
 
     let target = Target::default();
     let backend = match engine {
+        #[cfg(not(target_os = "windows"))]
         Engine::Cranelift => wasmer::BackendKind::Cranelift,
         #[cfg(feature = "llvm")]
         Engine::LLVM => wasmer::BackendKind::LLVM,
@@ -275,22 +277,26 @@ fn create_engine_for_wasm(wasm_bytes: &[u8], engine: Engine) -> wasmer::Engine {
         .unwrap_or_else(|_| wasmer::Engine::default_features_for_backend(&backend, &target));
 
     // We're going to run many parallel tests and so we use just a single thread for compilation.
-    let engine = match engine {
+    let engine: EngineBuilder = match engine {
+        #[cfg(not(target_os = "windows"))]
         Engine::Cranelift => {
             let mut config = wasmer::sys::Cranelift::default();
-            config.num_threads(NonZero::new(1).unwrap());
+            config.experimental_artifact(cfg!(target_os = "linux"));
+            config.num_threads(std::num::NonZero::new(1).unwrap());
             EngineBuilder::new(config)
         }
         #[cfg(feature = "llvm")]
         Engine::LLVM => {
             let mut config = wasmer::sys::LLVM::default();
-            config.num_threads(NonZero::new(1).unwrap());
+            config.experimental_artifact(cfg!(target_os = "linux"));
+            config.num_threads(std::num::NonZero::new(1).unwrap());
             EngineBuilder::new(config)
         }
         #[cfg(feature = "singlepass")]
         Engine::Singlepass => {
             let mut config = wasmer::sys::Singlepass::default();
-            config.num_threads(NonZero::new(1).unwrap());
+            config.experimental_artifact(cfg!(target_os = "linux"));
+            config.num_threads(std::num::NonZero::new(1).unwrap());
             EngineBuilder::new(config)
         }
         #[cfg(feature = "v8")]
@@ -320,6 +326,50 @@ pub(crate) fn run_wasm_with_runner_config(
     include_default_mounts: bool,
     configure_runner: impl FnOnce(&mut WasiRunner) -> Result<(), anyhow::Error>,
 ) -> Result<WasmRunResult, anyhow::Error> {
+    run_wasm_with_runner_config_inner(
+        wasm_path,
+        dir,
+        compiler,
+        program_name,
+        include_default_mounts,
+        configure_runner,
+        None::<fn(&mut PluggableRuntime) -> Result<(), anyhow::Error>>,
+    )
+}
+
+pub(crate) fn run_wasm_with_runner_and_runtime_config(
+    wasm_path: &PathBuf,
+    dir: &Path,
+    compiler: Engine,
+    program_name: Option<&str>,
+    include_default_mounts: bool,
+    configure_runner: impl FnOnce(&mut WasiRunner) -> Result<(), anyhow::Error>,
+    configure_runtime: impl FnOnce(&mut PluggableRuntime) -> Result<(), anyhow::Error>,
+) -> Result<WasmRunResult, anyhow::Error> {
+    run_wasm_with_runner_config_inner(
+        wasm_path,
+        dir,
+        compiler,
+        program_name,
+        include_default_mounts,
+        configure_runner,
+        Some(configure_runtime),
+    )
+}
+
+fn run_wasm_with_runner_config_inner<ConfigureRunner, ConfigureRuntime>(
+    wasm_path: &PathBuf,
+    dir: &Path,
+    compiler: Engine,
+    program_name: Option<&str>,
+    include_default_mounts: bool,
+    configure_runner: ConfigureRunner,
+    configure_runtime: Option<ConfigureRuntime>,
+) -> Result<WasmRunResult, anyhow::Error>
+where
+    ConfigureRunner: FnOnce(&mut WasiRunner) -> Result<(), anyhow::Error>,
+    ConfigureRuntime: FnOnce(&mut PluggableRuntime) -> Result<(), anyhow::Error>,
+{
     // Load the compiled WASM module
     let wasm_bytes = std::fs::read(wasm_path)?;
     let engine = create_engine_for_wasm(&wasm_bytes, compiler);
@@ -353,7 +403,7 @@ pub(crate) fn run_wasm_with_runner_config(
             let module_cache = wasmer_wasix::runtime::module_cache::SharedCache::default()
                 .with_fallback(wasmer_wasix::runtime::module_cache::FileSystemCache::new(
                     cache_dir,
-                    tokio_task_manager,
+                    tokio_task_manager.clone(),
                 ));
 
             let arc_cache = Arc::new(module_cache);
@@ -390,7 +440,16 @@ pub(crate) fn run_wasm_with_runner_config(
                     .with_stdout(stdout_capture)
                     .with_stderr(stderr_capture);
                 configure_runner(&mut runner)?;
-                runner.run_wasm(RuntimeOrEngine::Engine(engine), &program_name, module, hash)
+                let runtime_or_engine = match configure_runtime {
+                    Some(configure_runtime) => {
+                        let mut runtime = PluggableRuntime::new(tokio_task_manager);
+                        runtime.set_engine(engine.clone());
+                        configure_runtime(&mut runtime)?;
+                        RuntimeOrEngine::Runtime(Arc::new(runtime))
+                    }
+                    None => RuntimeOrEngine::Engine(engine),
+                };
+                runner.run_wasm(runtime_or_engine, &program_name, module, hash)
             })
         })
     });
@@ -403,20 +462,7 @@ pub(crate) fn run_wasm_with_runner_config(
     // Extract exit code from result
     let exit_code = match result {
         Ok(_) => 0,
-        Err(e) => {
-            // Try to extract exit code from error message
-            let error_msg = e.to_string();
-            if let Some(code_str) = error_msg.split("ExitCode::").nth(1) {
-                if let Some(code) = code_str.split_whitespace().next() {
-                    code.parse::<i32>()
-                        .unwrap_or_else(|_| panic!("exit code cannot be parsed: `{error_msg}`"))
-                } else {
-                    return Err(e);
-                }
-            } else {
-                return Err(e);
-            }
-        }
+        Err(e) => exit_code_from_error(&e).ok_or(e)?,
     };
 
     Ok(WasmRunResult {

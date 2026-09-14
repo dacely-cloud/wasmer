@@ -3,15 +3,16 @@
 
 use crate::{
     HashMap,
+    abi::{self},
     heap::{Heap, HeapData, HeapStyle},
     table::{TableData, TableSize},
-    translator::{EXN_REF_TYPE, LandingPad, TAG_TYPE},
+    translator::{EXN_REF_TYPE, LandingPad, TAG_TYPE, materialize_global_value},
 };
 use cranelift_codegen::{
     cursor::FuncCursor,
     ir::{
         self, AbiParam, ArgumentPurpose, BlockArg, Endianness, ExceptionTableData,
-        ExceptionTableItem, ExceptionTag, Function, InstBuilder, MemFlags, Signature,
+        ExceptionTableItem, ExceptionTag, Function, InstBuilder, MemFlagsData, Signature,
         UserExternalName,
         condcodes::IntCC,
         immediates::{Offset32, Uimm64},
@@ -22,13 +23,20 @@ use cranelift_codegen::{
 use cranelift_frontend::FunctionBuilder;
 use smallvec::SmallVec;
 use std::convert::TryFrom;
+use target_lexicon::Architecture;
+use wasmer_compiler::abi::ReturnAbi;
 use wasmer_compiler::wasmparser::HeapType;
 use wasmer_types::{
     FunctionIndex, GlobalIndex, LocalFunctionIndex, MemoryIndex, MemoryStyle, ModuleInfo,
     SignatureHash, SignatureIndex, TableIndex, TableStyle, TagIndex, Type as WasmerType,
     VMBuiltinFunctionIndex, VMOffsets, WasmError, WasmResult,
     entity::{EntityRef, PrimaryMap, SecondaryMap},
+    vmctx_offset,
 };
+
+fn insert_mem_flags(func: &mut Function, flags: ir::MemFlagsData) -> ir::MemFlags {
+    func.dfg.mem_flags.insert(flags).unwrap()
+}
 
 /// Compute an `ir::ExternalName` for a given wasm function index.
 pub fn get_function_name(func: &mut Function, func_index: FunctionIndex) -> ir::ExternalName {
@@ -81,6 +89,12 @@ pub enum GlobalVariable {
 pub struct FuncEnvironment<'module_environment> {
     /// Target-specified configuration.
     target_config: TargetFrontendConfig,
+
+    /// Target architecture used for native ABI classification.
+    architecture: Architecture,
+
+    /// Results of the function currently being translated.
+    return_types: Vec<WasmerType>,
 
     /// The module-level environment which this function-level environment belongs to.
     module: &'module_environment ModuleInfo,
@@ -187,6 +201,7 @@ pub struct FuncEnvironment<'module_environment> {
 impl<'module_environment> FuncEnvironment<'module_environment> {
     pub fn new(
         target_config: TargetFrontendConfig,
+        architecture: Architecture,
         module: &'module_environment ModuleInfo,
         signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
         signature_hashes: &'module_environment PrimaryMap<SignatureIndex, SignatureHash>,
@@ -195,6 +210,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     ) -> Self {
         Self {
             target_config,
+            architecture,
+            return_types: Vec::new(),
             module,
             signatures,
             signature_hashes,
@@ -245,9 +262,13 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         self.target_config.pointer_type()
     }
 
-    fn ensure_table_exists(&mut self, func: &mut ir::Function, index: TableIndex) {
+    fn ensure_table_exists(
+        &mut self,
+        func: &mut ir::Function,
+        index: TableIndex,
+    ) -> WasmResult<()> {
         if self.tables[index].is_some() {
-            return;
+            return Ok(());
         }
 
         let pointer_type = self.pointer_type();
@@ -259,12 +280,11 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             {
                 (
                     self.vmctx(func),
-                    i32::try_from(
+                    vmctx_offset(
                         self.offsets
                             .vmctx_fixed_funcref_table_anyfuncs(def_index)
                             .expect("fixed funcref table must have inline VMContext storage"),
-                    )
-                    .unwrap(),
+                    )?,
                     TableSize::Static {
                         bound: table.minimum,
                     },
@@ -276,21 +296,20 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                     let vmctx = self.vmctx(func);
                     if let Some(def_index) = self.module.local_table_index(index) {
                         let base_offset =
-                            i32::try_from(self.offsets.vmctx_vmtable_definition_base(def_index))
-                                .unwrap();
-                        let current_elements_offset = i32::try_from(
+                            vmctx_offset(self.offsets.vmctx_vmtable_definition_base(def_index))?;
+                        let current_elements_offset = vmctx_offset(
                             self.offsets
                                 .vmctx_vmtable_definition_current_elements(def_index),
-                        )
-                        .unwrap();
+                        )?;
                         (vmctx, base_offset, current_elements_offset)
                     } else {
                         let from_offset = self.offsets.vmctx_vmtable_import(index);
+                        let flags = insert_mem_flags(func, MemFlagsData::trusted().with_readonly());
                         let table = func.create_global_value(ir::GlobalValueData::Load {
                             base: vmctx,
-                            offset: Offset32::new(i32::try_from(from_offset).unwrap()),
+                            offset: Offset32::new(vmctx_offset(from_offset)?),
                             global_type: pointer_type,
-                            flags: MemFlags::trusted().with_readonly(),
+                            flags,
                         });
                         let base_offset = i32::from(self.offsets.vmtable_definition_base());
                         let current_elements_offset =
@@ -299,17 +318,18 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                     }
                 };
 
+                let flags = if Some(table.minimum) == table.maximum {
+                    // A fixed-size table can't be resized so its base address won't
+                    // change.
+                    insert_mem_flags(func, MemFlagsData::trusted().with_readonly())
+                } else {
+                    insert_mem_flags(func, MemFlagsData::trusted())
+                };
                 let base_gv = func.create_global_value(ir::GlobalValueData::Load {
                     base: ptr,
                     offset: Offset32::new(base_offset),
                     global_type: pointer_type,
-                    flags: if Some(table.minimum) == table.maximum {
-                        // A fixed-size table can't be resized so its base address won't
-                        // change.
-                        MemFlags::trusted().with_readonly()
-                    } else {
-                        MemFlags::trusted()
-                    },
+                    flags,
                 });
 
                 let bound = if Some(table.minimum) == table.maximum {
@@ -317,6 +337,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                         bound: table.minimum,
                     }
                 } else {
+                    let flags = insert_mem_flags(func, MemFlagsData::trusted());
                     TableSize::Dynamic {
                         bound_gv: func.create_global_value(ir::GlobalValueData::Load {
                             base: ptr,
@@ -327,7 +348,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                                 ) * 8,
                             )
                             .unwrap(),
-                            flags: MemFlags::trusted(),
+                            flags,
                         }),
                     }
                 };
@@ -342,6 +363,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             element_size,
             inline_anyfunc,
         });
+        Ok(())
     }
 
     fn vmctx(&mut self, func: &mut Function) -> ir::GlobalValue {
@@ -741,7 +763,9 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             func.import_signature(Signature {
                 params: vec![
                     AbiParam::special(self.pointer_type(), ArgumentPurpose::VMContext),
-                    // Memory index.
+                    // Destination memory index.
+                    AbiParam::new(I32),
+                    // Source memory index.
                     AbiParam::new(I32),
                     // Destination address.
                     AbiParam::new(I32),
@@ -761,22 +785,11 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     fn get_memory_copy_func(
         &mut self,
         func: &mut Function,
-        memory_index: MemoryIndex,
-    ) -> (ir::SigRef, usize, VMBuiltinFunctionIndex) {
-        let sig = self.get_memory_copy_sig(func);
-        if let Some(local_memory_index) = self.module.local_memory_index(memory_index) {
-            (
-                sig,
-                local_memory_index.index(),
-                VMBuiltinFunctionIndex::get_memory_copy_index(),
-            )
-        } else {
-            (
-                sig,
-                memory_index.index(),
-                VMBuiltinFunctionIndex::get_imported_memory_copy_index(),
-            )
-        }
+    ) -> (ir::SigRef, VMBuiltinFunctionIndex) {
+        (
+            self.get_memory_copy_sig(func),
+            VMBuiltinFunctionIndex::get_memory_copy_index(),
+        )
     }
 
     fn get_memory_fill_sig(&mut self, func: &mut Function) -> ir::SigRef {
@@ -1306,21 +1319,20 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         &mut self,
         pos: &mut FuncCursor<'_>,
         callee_func_idx: VMBuiltinFunctionIndex,
-    ) -> (ir::Value, ir::Value) {
+    ) -> WasmResult<(ir::Value, ir::Value)> {
         // We use an indirect call so that we don't have to patch the code at runtime.
         let pointer_type = self.pointer_type();
         let vmctx = self.vmctx(pos.func);
-        let base = pos.ins().global_value(pointer_type, vmctx);
+        let base = materialize_global_value(pos, pointer_type, vmctx);
 
-        let mut mem_flags = ir::MemFlags::trusted();
+        let mut mem_flags = ir::MemFlagsData::trusted();
         mem_flags.set_readonly();
 
         // Load the callee address.
-        let body_offset =
-            i32::try_from(self.offsets.vmctx_builtin_function(callee_func_idx)).unwrap();
+        let body_offset = vmctx_offset(self.offsets.vmctx_builtin_function(callee_func_idx))?;
         let func_addr = pos.ins().load(pointer_type, mem_flags, base, body_offset);
 
-        (base, func_addr)
+        Ok((base, func_addr))
     }
 
     fn get_or_init_funcref_table_elem(
@@ -1328,28 +1340,27 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         builder: &mut FunctionBuilder,
         table_index: TableIndex,
         index: ir::Value,
-    ) -> (ir::Value, bool) {
+    ) -> WasmResult<(ir::Value, bool)> {
         let pointer_type = self.pointer_type();
-        self.ensure_table_exists(builder.func, table_index);
+        self.ensure_table_exists(builder.func, table_index)?;
         let table_data = self.tables[table_index].as_ref().unwrap();
 
         let (table_entry_addr, flags) =
             table_data.prepare_table_addr(builder, index, pointer_type, false);
-        if table_data.inline_anyfunc {
+        Ok(if table_data.inline_anyfunc {
             (table_entry_addr, true)
         } else {
             (
                 builder.ins().load(pointer_type, flags, table_entry_addr, 0),
                 false,
             )
-        }
+        })
     }
 }
 
 impl FuncEnvironment<'_> {
-    pub(crate) fn is_wasm_parameter(&self, _signature: &ir::Signature, index: usize) -> bool {
-        // The first parameter is the vmctx. The rest are the wasm parameters.
-        index >= 1
+    pub(crate) fn is_wasm_parameter(&self, signature: &ir::Signature, index: usize) -> bool {
+        signature.params[index].purpose == ArgumentPurpose::Normal
     }
 
     pub(crate) fn translate_unreachable(
@@ -1358,7 +1369,7 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let (func_sig, func_idx) = self.get_raise_trap_func(builder.func);
         let mut pos = builder.cursor();
-        let (_, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (_, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let trap_code = pos
             .ins()
             .iconst(I32, wasmer_types::TrapCode::UnreachableCodeReached as i64);
@@ -1378,10 +1389,11 @@ impl FuncEnvironment<'_> {
         delta: ir::Value,
         init_value: ir::Value,
     ) -> WasmResult<ir::Value> {
-        self.ensure_table_exists(pos.func, table_index);
+        self.ensure_table_exists(pos.func, table_index)?;
         let (func_sig, index_arg, func_idx) = self.get_table_grow_func(pos.func, table_index);
         let table_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos.ins().call_indirect(
             func_sig,
             func_addr,
@@ -1396,12 +1408,13 @@ impl FuncEnvironment<'_> {
         table_index: TableIndex,
         index: ir::Value,
     ) -> WasmResult<ir::Value> {
-        self.ensure_table_exists(builder.func, table_index);
+        self.ensure_table_exists(builder.func, table_index)?;
         let mut pos = builder.cursor();
 
         let (func_sig, table_index_arg, func_idx) = self.get_table_get_func(pos.func, table_index);
         let table_index = pos.ins().iconst(I32, table_index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos
             .ins()
             .call_indirect(func_sig, func_addr, &[vmctx, table_index, index]);
@@ -1415,12 +1428,13 @@ impl FuncEnvironment<'_> {
         value: ir::Value,
         index: ir::Value,
     ) -> WasmResult<()> {
-        self.ensure_table_exists(builder.func, table_index);
+        self.ensure_table_exists(builder.func, table_index)?;
         let mut pos = builder.cursor();
 
         let (func_sig, table_index_arg, func_idx) = self.get_table_set_func(pos.func, table_index);
         let n_table_index = pos.ins().iconst(I32, table_index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         pos.ins()
             .call_indirect(func_sig, func_addr, &[vmctx, n_table_index, index, value]);
         Ok(())
@@ -1434,9 +1448,10 @@ impl FuncEnvironment<'_> {
         val: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        self.ensure_table_exists(pos.func, table_index);
+        self.ensure_table_exists(pos.func, table_index)?;
         let (func_sig, table_index_arg, func_idx) = self.get_table_fill_func(pos.func, table_index);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         let table_index_arg = pos.ins().iconst(I32, table_index_arg as i64);
         pos.ins().call_indirect(
@@ -1491,7 +1506,7 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         let bool_is_null =
             pos.ins()
-                .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, value, 0);
+                .icmp_imm_s(cranelift_codegen::ir::condcodes::IntCC::Equal, value, 0);
         Ok(pos.ins().uextend(ir::types::I32, bool_is_null))
     }
 
@@ -1501,7 +1516,8 @@ impl FuncEnvironment<'_> {
         func_index: FunctionIndex,
     ) -> WasmResult<ir::Value> {
         let (func_sig, func_index_arg, func_idx) = self.get_func_ref_func(pos.func, func_index);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         let func_index_arg = pos.ins().iconst(I32, func_index_arg as i64);
         let call_inst = pos
@@ -1539,20 +1555,20 @@ impl FuncEnvironment<'_> {
             let vmctx = self.vmctx(func);
             if let Some(def_index) = self.module.local_memory_index(index) {
                 let base_offset =
-                    i32::try_from(self.offsets.vmctx_vmmemory_definition_base(def_index)).unwrap();
-                let current_length_offset = i32::try_from(
+                    vmctx_offset(self.offsets.vmctx_vmmemory_definition_base(def_index))?;
+                let current_length_offset = vmctx_offset(
                     self.offsets
                         .vmctx_vmmemory_definition_current_length(def_index),
-                )
-                .unwrap();
+                )?;
                 (vmctx, base_offset, current_length_offset)
             } else {
                 let from_offset = self.offsets.vmctx_vmmemory_import_definition(index);
+                let flags = insert_mem_flags(func, ir::MemFlagsData::trusted().with_readonly());
                 let memory = func.create_global_value(ir::GlobalValueData::Load {
                     base: vmctx,
-                    offset: Offset32::new(i32::try_from(from_offset).unwrap()),
+                    offset: Offset32::new(vmctx_offset(from_offset)?),
                     global_type: pointer_type,
-                    flags: ir::MemFlags::trusted().with_readonly(),
+                    flags,
                 });
                 let base_offset = i32::from(self.offsets.vmmemory_definition_base());
                 let current_length_offset =
@@ -1565,11 +1581,12 @@ impl FuncEnvironment<'_> {
         // allocated up front and never moved.
         let (offset_guard_size, heap_style, readonly_base) = match self.memory_styles[index] {
             MemoryStyle::Dynamic { offset_guard_size } => {
+                let flags = insert_mem_flags(func, ir::MemFlagsData::trusted());
                 let heap_bound = func.create_global_value(ir::GlobalValueData::Load {
                     base: ptr,
                     offset: Offset32::new(current_length_offset),
                     global_type: pointer_type,
-                    flags: ir::MemFlags::trusted(),
+                    flags,
                 });
                 (
                     Uimm64::new(offset_guard_size),
@@ -1579,27 +1596,23 @@ impl FuncEnvironment<'_> {
                     false,
                 )
             }
-            MemoryStyle::Static {
-                bound,
-                offset_guard_size,
-            } => (
-                Uimm64::new(offset_guard_size),
-                HeapStyle::Static {
-                    bound: bound.bytes().0 as u64,
-                },
+            MemoryStyle::Static => (
+                Uimm64::new(MemoryStyle::static_offset_guard_size()),
+                HeapStyle::Static,
                 true,
             ),
         };
 
+        let flags = if readonly_base {
+            insert_mem_flags(func, ir::MemFlagsData::trusted().with_readonly())
+        } else {
+            insert_mem_flags(func, ir::MemFlagsData::trusted())
+        };
         let heap_base = func.create_global_value(ir::GlobalValueData::Load {
             base: ptr,
             offset: Offset32::new(base_offset),
             global_type: pointer_type,
-            flags: if readonly_base {
-                ir::MemFlags::trusted().with_readonly()
-            } else {
-                ir::MemFlags::trusted()
-            },
+            flags,
         });
         Ok(self.heaps.push(HeapData {
             base: heap_base,
@@ -1625,14 +1638,15 @@ impl FuncEnvironment<'_> {
             if let Some(def_index) = self.module.local_global_index(index) {
                 let from_offset = self.offsets.vmctx_vmglobal_definition(def_index);
                 let global = func.create_global_value(ir::GlobalValueData::VMContext);
-                (global, i32::try_from(from_offset).unwrap())
+                (global, vmctx_offset(from_offset)?)
             } else {
                 let from_offset = self.offsets.vmctx_vmglobal_import_definition(index);
+                let flags = insert_mem_flags(func, MemFlagsData::trusted());
                 let global = func.create_global_value(ir::GlobalValueData::Load {
                     base: vmctx,
-                    offset: Offset32::new(i32::try_from(from_offset).unwrap()),
+                    offset: Offset32::new(vmctx_offset(from_offset)?),
                     global_type: pointer_type,
-                    flags: MemFlags::trusted(),
+                    flags,
                 });
                 (global, 0)
             }
@@ -1679,6 +1693,39 @@ impl FuncEnvironment<'_> {
         }))
     }
 
+    fn prepare_wasm_call(
+        &self,
+        builder: &mut FunctionBuilder,
+        result_types: &[WasmerType],
+    ) -> (ReturnAbi, Option<(ir::Value, abi::ReturnAreaLayout)>) {
+        let return_abi = abi::classify_returns(self.architecture, result_types);
+        let sret = match &return_abi {
+            ReturnAbi::Sret(types) => Some(abi::allocate_return_area(
+                builder,
+                types,
+                self.target_config,
+            )),
+            _ => None,
+        };
+        (return_abi, sret)
+    }
+
+    fn finish_wasm_call(
+        &self,
+        builder: &mut FunctionBuilder,
+        return_abi: &ReturnAbi,
+        carriers: &[ir::Value],
+        sret: Option<(ir::Value, abi::ReturnAreaLayout)>,
+    ) -> SmallVec<[ir::Value; 4]> {
+        match return_abi {
+            ReturnAbi::Sret(types) => {
+                let (ptr, layout) = sret.expect("sret call has a return area");
+                abi::load_sret(builder, ptr, &layout, types, self.target_config)
+            }
+            _ => abi::unpack_register_returns(builder, return_abi, carriers, self.target_config),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn translate_call_indirect(
         &mut self,
@@ -1694,10 +1741,10 @@ impl FuncEnvironment<'_> {
 
         // Get the anyfunc pointer (the funcref) from the table.
         let (anyfunc_ptr, inline_anyfunc) =
-            self.get_or_init_funcref_table_elem(builder, table_index, callee);
+            self.get_or_init_funcref_table_elem(builder, table_index, callee)?;
 
         // Dereference table_entry_addr to get the function address.
-        let mem_flags = ir::MemFlags::trusted();
+        let mem_flags = ir::MemFlagsData::trusted();
 
         // check if the funcref is null
         if !inline_anyfunc {
@@ -1729,7 +1776,7 @@ impl FuncEnvironment<'_> {
                 );
 
                 // Load the callee ID.
-                let mem_flags = ir::MemFlags::trusted();
+                let mem_flags = ir::MemFlagsData::trusted();
                 let callee_sig_hash = builder.ins().load(
                     sig_hash_type,
                     mem_flags,
@@ -1745,7 +1792,12 @@ impl FuncEnvironment<'_> {
             }
         }
 
+        let (return_abi, sret) =
+            self.prepare_wasm_call(builder, self.module.signatures[sig_index].results());
         let mut real_call_args = Vec::with_capacity(call_args.len() + 2);
+        if let Some((ptr, _)) = &sret {
+            real_call_args.push(*ptr);
+        }
 
         // First append the callee vmctx address.
         let vmctx = builder.ins().load(
@@ -1768,7 +1820,7 @@ impl FuncEnvironment<'_> {
             landing_pad,
             false,
         );
-        Ok(results)
+        Ok(self.finish_wasm_call(builder, &return_abi, &results, sret))
     }
 
     pub(crate) fn translate_call(
@@ -1779,7 +1831,13 @@ impl FuncEnvironment<'_> {
         call_args: &[ir::Value],
         landing_pad: Option<LandingPad>,
     ) -> WasmResult<SmallVec<[ir::Value; 4]>> {
+        let sig_index = self.module.functions[callee_index];
+        let (return_abi, sret) =
+            self.prepare_wasm_call(builder, self.module.signatures[sig_index].results());
         let mut real_call_args = Vec::with_capacity(call_args.len() + 2);
+        if let Some((ptr, _)) = &sret {
+            real_call_args.push(*ptr);
+        }
 
         // Handle direct calls to locally-defined functions.
         if !self.module.is_imported_function(callee_index) {
@@ -1803,7 +1861,7 @@ impl FuncEnvironment<'_> {
                 landing_pad,
                 false,
             );
-            return Ok(results);
+            return Ok(self.finish_wasm_call(builder, &return_abi, &results, sret));
         }
 
         // Handle direct calls to imported functions. We use an indirect call
@@ -1811,23 +1869,22 @@ impl FuncEnvironment<'_> {
         let pointer_type = self.pointer_type();
         let sig_ref = builder.func.dfg.ext_funcs[callee].signature;
         let vmctx = self.vmctx(builder.func);
-        let base = builder.ins().global_value(pointer_type, vmctx);
+        let base = materialize_global_value(&mut builder.cursor(), pointer_type, vmctx);
 
-        let mem_flags = ir::MemFlags::trusted();
+        let mem_flags = ir::MemFlagsData::trusted();
 
         // Load the callee address.
-        let body_offset =
-            i32::try_from(self.offsets.vmctx_vmfunction_import_body(callee_index)).unwrap();
+        let body_offset = vmctx_offset(self.offsets.vmctx_vmfunction_import_body(callee_index))?;
         let func_addr = builder
             .ins()
             .load(pointer_type, mem_flags, base, body_offset);
 
         // First append the callee vmctx address.
-        let vmctx_offset =
-            i32::try_from(self.offsets.vmctx_vmfunction_import_vmctx(callee_index)).unwrap();
+        let vmctx_arg_offset =
+            vmctx_offset(self.offsets.vmctx_vmfunction_import_vmctx(callee_index))?;
         let vmctx = builder
             .ins()
-            .load(pointer_type, mem_flags, base, vmctx_offset);
+            .load(pointer_type, mem_flags, base, vmctx_arg_offset);
         real_call_args.push(vmctx);
 
         // Then append the regular call arguments.
@@ -1842,7 +1899,7 @@ impl FuncEnvironment<'_> {
             landing_pad,
             false,
         );
-        Ok(results)
+        Ok(self.finish_wasm_call(builder, &return_abi, &results, sret))
     }
 
     pub(crate) fn tag_param_arity(&self, tag_index: TagIndex) -> usize {
@@ -1855,12 +1912,12 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         exn_ptr: ir::Value,
-    ) -> ir::Value {
+    ) -> WasmResult<ir::Value> {
         let (read_sig, read_idx) = self.get_read_exception_func(builder.func);
         let mut pos = builder.cursor();
-        let (_, read_addr) = self.translate_load_builtin_function_address(&mut pos, read_idx);
+        let (_, read_addr) = self.translate_load_builtin_function_address(&mut pos, read_idx)?;
         let read_call = builder.ins().call_indirect(read_sig, read_addr, &[exn_ptr]);
-        builder.inst_results(read_call)[0]
+        Ok(builder.inst_results(read_call)[0])
     }
 
     pub(crate) fn translate_exn_unbox(
@@ -1874,7 +1931,7 @@ impl FuncEnvironment<'_> {
         let (read_exnref_sig, read_exnref_idx) = self.get_read_exnref_func(builder.func);
         let mut pos = builder.cursor();
         let (vmctx, read_exnref_addr) =
-            self.translate_load_builtin_function_address(&mut pos, read_exnref_idx);
+            self.translate_load_builtin_function_address(&mut pos, read_exnref_idx)?;
         let read_exnref_call =
             builder
                 .ins()
@@ -1882,7 +1939,7 @@ impl FuncEnvironment<'_> {
         let payload_ptr = builder.inst_results(read_exnref_call)[0];
 
         let mut values = SmallVec::<[ir::Value; 4]>::with_capacity(layout.fields.len());
-        let data_flags = ir::MemFlags::trusted();
+        let data_flags = ir::MemFlagsData::trusted();
         for field in &layout.fields {
             let value = builder.ins().load(
                 field.ty,
@@ -1914,7 +1971,8 @@ impl FuncEnvironment<'_> {
 
         let (alloc_sig, alloc_idx) = self.get_alloc_exception_func(builder.func);
         let mut pos = builder.cursor();
-        let (vmctx, alloc_addr) = self.translate_load_builtin_function_address(&mut pos, alloc_idx);
+        let (vmctx, alloc_addr) =
+            self.translate_load_builtin_function_address(&mut pos, alloc_idx)?;
         let tag_value = builder
             .ins()
             .iconst(TAG_TYPE, i64::from(tag_index.as_u32()));
@@ -1926,14 +1984,14 @@ impl FuncEnvironment<'_> {
         let (read_exnref_sig, read_exnref_idx) = self.get_read_exnref_func(builder.func);
         let mut pos = builder.cursor();
         let (vmctx, read_exnref_addr) =
-            self.translate_load_builtin_function_address(&mut pos, read_exnref_idx);
+            self.translate_load_builtin_function_address(&mut pos, read_exnref_idx)?;
         let read_exnref_call =
             builder
                 .ins()
                 .call_indirect(read_exnref_sig, read_exnref_addr, &[vmctx, exnref]);
         let payload_ptr = builder.inst_results(read_exnref_call)[0];
 
-        let store_flags = ir::MemFlags::trusted();
+        let store_flags = ir::MemFlagsData::trusted();
         for (field, value) in layout.fields.iter().zip(args.iter()) {
             debug_assert_eq!(
                 builder.func.dfg.value_type(*value),
@@ -1951,7 +2009,7 @@ impl FuncEnvironment<'_> {
         let (throw_sig, throw_idx) = self.get_throw_func(builder.func);
         let mut pos = builder.cursor();
         let (vmctx_value, throw_addr) =
-            self.translate_load_builtin_function_address(&mut pos, throw_idx);
+            self.translate_load_builtin_function_address(&mut pos, throw_idx)?;
         let call_args = [vmctx_value, exnref];
 
         let _ = self.call_indirect_with_handlers(
@@ -1976,7 +2034,7 @@ impl FuncEnvironment<'_> {
         let (throw_sig, throw_idx) = self.get_throw_func(builder.func);
         let mut pos = builder.cursor();
         let (vmctx_value, throw_addr) =
-            self.translate_load_builtin_function_address(&mut pos, throw_idx);
+            self.translate_load_builtin_function_address(&mut pos, throw_idx)?;
         let call_args = [vmctx_value, exnref];
 
         let _ = self.call_indirect_with_handlers(
@@ -2003,13 +2061,14 @@ impl FuncEnvironment<'_> {
         let exn_arg = if exn_ty == pointer_type {
             exn_ptr
         } else {
-            let mut flags = MemFlags::new();
+            let mut flags = MemFlagsData::new();
             flags.set_endianness(Endianness::Little);
             builder.ins().bitcast(pointer_type, flags, exn_ptr)
         };
 
         let mut pos = builder.cursor();
-        let (vmctx_value, func_addr) = self.translate_load_builtin_function_address(&mut pos, idx);
+        let (vmctx_value, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, idx)?;
         let call = builder
             .ins()
             .call_indirect(sig, func_addr, &[vmctx_value, exn_arg]);
@@ -2024,7 +2083,7 @@ impl FuncEnvironment<'_> {
         let (throw_sig, throw_idx) = self.get_throw_func(builder.func);
         let mut pos = builder.cursor();
         let (vmctx_value, throw_addr) =
-            self.translate_load_builtin_function_address(&mut pos, throw_idx);
+            self.translate_load_builtin_function_address(&mut pos, throw_idx)?;
         builder
             .ins()
             .call_indirect(throw_sig, throw_addr, &[vmctx_value, exnref]);
@@ -2041,7 +2100,8 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         let (func_sig, index_arg, func_idx) = self.get_memory_grow_func(pos.func, index);
         let memory_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos
             .ins()
             .call_indirect(func_sig, func_addr, &[vmctx, val, memory_index]);
@@ -2056,7 +2116,8 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         let (func_sig, index_arg, func_idx) = self.get_memory_size_func(pos.func, index);
         let memory_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos
             .ins()
             .call_indirect(func_sig, func_addr, &[vmctx, memory_index]);
@@ -2069,20 +2130,25 @@ impl FuncEnvironment<'_> {
         mut pos: FuncCursor,
         src_index: MemoryIndex,
         _src_heap: Heap,
-        _dst_index: MemoryIndex,
+        dst_index: MemoryIndex,
         _dst_heap: Heap,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        let (func_sig, src_index, func_idx) = self.get_memory_copy_func(pos.func, src_index);
+        let (func_sig, func_idx) = self.get_memory_copy_func(pos.func);
 
-        let src_index_arg = pos.ins().iconst(I32, src_index as i64);
+        let dst_index_arg = pos.ins().iconst(I32, dst_index.index() as i64);
+        let src_index_arg = pos.ins().iconst(I32, src_index.index() as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
-        pos.ins()
-            .call_indirect(func_sig, func_addr, &[vmctx, src_index_arg, dst, src, len]);
+        pos.ins().call_indirect(
+            func_sig,
+            func_addr,
+            &[vmctx, dst_index_arg, src_index_arg, dst, src, len],
+        );
 
         Ok(())
     }
@@ -2100,7 +2166,8 @@ impl FuncEnvironment<'_> {
 
         let memory_index_arg = pos.ins().iconst(I32, memory_index as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         pos.ins().call_indirect(
             func_sig,
@@ -2127,7 +2194,8 @@ impl FuncEnvironment<'_> {
         let memory_index_arg = pos.ins().iconst(I32, memory_index.index() as i64);
         let seg_index_arg = pos.ins().iconst(I32, seg_index as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         pos.ins().call_indirect(
             func_sig,
@@ -2145,7 +2213,8 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let (func_sig, func_idx) = self.get_data_drop_func(pos.func);
         let seg_index_arg = pos.ins().iconst(I32, seg_index as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         pos.ins()
             .call_indirect(func_sig, func_addr, &[vmctx, seg_index_arg]);
         Ok(())
@@ -2156,10 +2225,11 @@ impl FuncEnvironment<'_> {
         mut pos: FuncCursor,
         table_index: TableIndex,
     ) -> WasmResult<ir::Value> {
-        self.ensure_table_exists(pos.func, table_index);
+        self.ensure_table_exists(pos.func, table_index)?;
         let (func_sig, index_arg, func_idx) = self.get_table_size_func(pos.func, table_index);
         let table_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos
             .ins()
             .call_indirect(func_sig, func_addr, &[vmctx, table_index]);
@@ -2175,15 +2245,16 @@ impl FuncEnvironment<'_> {
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        self.ensure_table_exists(pos.func, src_table_index);
-        self.ensure_table_exists(pos.func, dst_table_index);
+        self.ensure_table_exists(pos.func, src_table_index)?;
+        self.ensure_table_exists(pos.func, dst_table_index)?;
         let (func_sig, dst_table_index_arg, src_table_index_arg, func_idx) =
             self.get_table_copy_func(pos.func, dst_table_index, src_table_index);
 
         let dst_table_index_arg = pos.ins().iconst(I32, dst_table_index_arg as i64);
         let src_table_index_arg = pos.ins().iconst(I32, src_table_index_arg as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         pos.ins().call_indirect(
             func_sig,
@@ -2210,13 +2281,14 @@ impl FuncEnvironment<'_> {
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        self.ensure_table_exists(pos.func, table_index);
+        self.ensure_table_exists(pos.func, table_index)?;
         let (func_sig, table_index_arg, func_idx) = self.get_table_init_func(pos.func, table_index);
 
         let table_index_arg = pos.ins().iconst(I32, table_index_arg as i64);
         let seg_index_arg = pos.ins().iconst(I32, seg_index as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         pos.ins().call_indirect(
             func_sig,
@@ -2236,7 +2308,8 @@ impl FuncEnvironment<'_> {
 
         let elem_index_arg = pos.ins().iconst(I32, elem_index as i64);
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
 
         pos.ins()
             .call_indirect(func_sig, func_addr, &[vmctx, elem_index_arg]);
@@ -2259,7 +2332,8 @@ impl FuncEnvironment<'_> {
             self.get_memory_atomic_wait32_func(pos.func, index)
         };
         let memory_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst = pos.ins().call_indirect(
             func_sig,
             func_addr,
@@ -2278,7 +2352,8 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         let (func_sig, index_arg, func_idx) = self.get_memory_atomic_notify_func(pos.func, index);
         let memory_index = pos.ins().iconst(I32, index_arg as i64);
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let (vmctx, func_addr) =
+            self.translate_load_builtin_function_address(&mut pos, func_idx)?;
         let call_inst =
             pos.ins()
                 .call_indirect(func_sig, func_addr, &[vmctx, memory_index, addr, count]);
@@ -2293,8 +2368,32 @@ impl FuncEnvironment<'_> {
         let func_index = self.module.func_index(function_index);
         let sig_idx = self.module.functions[func_index];
         let signature = &self.module.signatures[sig_idx];
+        self.return_types = signature.results().to_vec();
         for param in signature.params() {
             self.type_stack.push(*param);
+        }
+    }
+
+    pub(crate) fn return_types(&self) -> &[WasmerType] {
+        &self.return_types
+    }
+
+    pub(crate) fn emit_wasm_return(&mut self, builder: &mut FunctionBuilder, values: &[ir::Value]) {
+        let return_abi = abi::classify_returns(self.architecture, &self.return_types);
+        match &return_abi {
+            ReturnAbi::Sret(types) => {
+                let ptr = builder
+                    .func
+                    .special_param(ArgumentPurpose::StructReturn)
+                    .expect("sret function has a StructReturn parameter");
+                let layout = abi::return_area_layout(types);
+                abi::store_sret(builder, ptr, &layout, values);
+                builder.ins().return_(&[]);
+            }
+            _ => {
+                let packed = abi::pack_register_returns(builder, &return_abi, values);
+                builder.ins().return_(&packed);
+            }
         }
     }
 
@@ -2304,9 +2403,5 @@ impl FuncEnvironment<'_> {
 
     pub(crate) fn heaps(&self) -> &PrimaryMap<Heap, HeapData> {
         &self.heaps
-    }
-
-    pub(crate) fn is_wasm_return(&self, signature: &ir::Signature, index: usize) -> bool {
-        signature.returns[index].purpose == ir::ArgumentPurpose::Normal
     }
 }

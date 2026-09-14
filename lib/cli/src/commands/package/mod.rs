@@ -1,10 +1,12 @@
 mod build;
 mod common;
 mod download;
+mod get;
 pub mod publish;
 mod push;
 mod search;
 mod tag;
+mod tree;
 mod unpack;
 
 pub use build::PackageBuild;
@@ -22,6 +24,8 @@ pub enum Package {
     Tag(tag::PackageTag),
     Push(push::PackagePush),
     Publish(publish::PackagePublish),
+    Tree(tree::PackageTree),
     Unpack(unpack::PackageUnpack),
     Search(search::PackageSearch),
+    Get(get::PackageGet),
 }

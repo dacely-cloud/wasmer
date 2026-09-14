@@ -1,10 +1,11 @@
 //! Data types, functions and traits for `sys` runtime's `Instance` implementation.
 
 use crate::{
-    Extern, error::InstantiationError, exports::Exports, imports::Imports, module::Module,
-    store::AsStoreMut,
+    Extern, Global, error::InstantiationError, exports::Exports, imports::Imports, module::Module,
+    store::{AsStoreMut, AsStoreRef},
 };
-use wasmer_vm::{StoreHandle, VMInstance};
+use wasmer_types::{ExportIndex, GlobalIndex};
+use wasmer_vm::{StoreHandle, VMInstance, VMInstanceSnapshot, VMTablesSnapshot};
 
 use super::store::Store;
 
@@ -63,6 +64,37 @@ impl Instance {
         Ok((instance, exports))
     }
 
+    /// Return a [`Global`] handle for every DEFINED (non-imported) global in
+    /// this instance, INCLUDING ones the module does not export. The caller
+    /// passes the defined-global index range `[start, end)` taken from
+    /// `Module::info()` (`num_imported_globals .. globals.len()`).
+    ///
+    /// `instance.exports` only surfaces exported globals, so a non-exported
+    /// mutable global (e.g. the AssemblyScript allocator bump pointer) is
+    /// otherwise invisible to an embedder and leaks state across reuses of a
+    /// pooled instance. This reaches them via the VM's per-index export
+    /// lookup, which does not require the global to be exported.
+    pub fn defined_globals(
+        &self,
+        store: &mut impl AsStoreMut,
+        start: usize,
+        end: usize,
+    ) -> Vec<Global> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for idx in start..end {
+            // Materialise the VM extern for this global index, then drop the
+            // instance borrow before re-borrowing the store to wrap it.
+            let raw = {
+                let inst = self._handle.get_mut(store.objects_mut().as_sys_mut());
+                inst.lookup_by_declaration(ExportIndex::Global(GlobalIndex::from_u32(idx as u32)))
+            };
+            if let Extern::Global(g) = Extern::from_vm_extern(store, crate::vm::VMExtern::Sys(raw)) {
+                out.push(g);
+            }
+        }
+        out
+    }
+
     fn get_exports(
         store: &mut impl AsStoreMut,
         module: &Module,
@@ -77,6 +109,64 @@ impl Instance {
                 (name, extern_)
             })
             .collect::<Exports>()
+    }
+
+    /// Capture a snapshot of this instance's mutable state (defined memories,
+    /// globals, and tables). See [`wasmer_vm::VMInstance::snapshot`].
+    pub(crate) fn snapshot(&self, store: &impl AsStoreRef) -> VMInstanceSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot()
+    }
+
+    /// Capture an eager (memcpy) snapshot for the bounded reset fast path.
+    pub(crate) fn snapshot_eager(&self, store: &impl AsStoreRef) -> VMInstanceSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot_eager()
+    }
+
+    /// Restore this instance to a previously captured snapshot.
+    pub(crate) fn reset_to_snapshot(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMInstanceSnapshot,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_to_snapshot(snapshot)
+    }
+
+    /// Restore from a snapshot, memcpy'ing each memory only over its first
+    /// `mem_dirty_bytes`. See [`wasmer_vm::VMInstance::reset_to_snapshot_bounded`].
+    pub(crate) fn reset_to_snapshot_bounded(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMInstanceSnapshot,
+        mem_dirty_bytes: usize,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_to_snapshot_bounded(snapshot, mem_dirty_bytes)
+    }
+
+    /// Capture a table-only snapshot (no memory/globals). See
+    /// [`wasmer_vm::VMInstance::snapshot_tables`].
+    pub(crate) fn snapshot_tables(&self, store: &impl AsStoreRef) -> VMTablesSnapshot {
+        self._handle
+            .get(store.as_store_ref().objects().as_sys())
+            .snapshot_tables()
+    }
+
+    /// Restore every defined table to a previously captured table snapshot.
+    pub(crate) fn reset_tables(
+        &self,
+        store: &mut impl AsStoreMut,
+        snapshot: &VMTablesSnapshot,
+    ) -> Result<(), wasmer_types::MemoryError> {
+        self._handle
+            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
+            .reset_tables(snapshot)
     }
 }
 
