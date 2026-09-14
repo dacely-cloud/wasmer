@@ -8,6 +8,7 @@ The nested submodules match upstream's pins.
 
 Registry dependencies were checked against crates.io's sparse index and
 updated to their latest non-yanked stable releases. Rust is pinned to 1.98.0.
+TOML is 1.1.6 (published with `+spec-1.1.0` build metadata).
 The workspace lockfile was refreshed. Two intentional compatibility cases:
 
 - `bincode` stays at 2.0.1. The 3.0.0 crate's entire `src/lib.rs` is a
@@ -27,6 +28,7 @@ Validation on aarch64 Linux with LLVM 22:
 
 - `make lint` (YAML, C/C++, Rust formatting, workspace/CLI/fuzz Clippy, TOML).
 - Wasmer CLI build with LLVM enabled.
+- Configuration and package tests with TOML 1.1.6: 83 passed.
 - Wasmer API `current_store`, `instance_snapshot`, and `jspi_async`: 27 tests
   passed; one manual benchmark remains ignored.
 - Backend integration: 825 default-feature and 719 no-default-feature tests;
