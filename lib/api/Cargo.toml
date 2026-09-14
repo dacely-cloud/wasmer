@@ -74,7 +74,7 @@ wat.workspace = true
 tempfile.workspace = true
 anyhow.workspace = true
 macro-wasmer-engine-test = { version = "7.4.0", path = "./macro-wasmer-engine-test" }
-futures = "0.3"
+futures = "0.3.34"
 tokio = { workspace = true, features = ["full"] }
 crossbeam-channel.workspace = true
 

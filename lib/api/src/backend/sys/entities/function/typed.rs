@@ -139,7 +139,7 @@ macro_rules! impl_native_traits {
             /// stack, so a suspending host import parks the call instead of
             /// blocking the worker. Generic over the signature exactly like
             /// `call_sys`. The store context is installed by the future's poll
-            /// before each resume, so `ensure_installed` here is a no-op
+            /// before each resume, so `install` here is a no-op
             /// (same invariant the dynamic `call_wasm_raw` relies on).
             #[allow(unused_mut)]
             #[allow(clippy::too_many_arguments)]
@@ -186,7 +186,7 @@ macro_rules! impl_native_traits {
 
                     // Already installed by the future's poll -> no-op here.
                     let store_install_guard = unsafe {
-                        StoreContext::ensure_installed(store.as_store_mut().inner as *mut _)
+                        StoreContext::install(store.as_store_mut().inner as *mut _)
                     };
 
                     let mut r;

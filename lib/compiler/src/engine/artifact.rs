@@ -877,8 +877,10 @@ impl Artifact {
                         ))
                     })?;
                     function_offsets = Some(
-                        data.chunks_exact(std::mem::size_of::<usize>())
-                            .map(|chunk| usize::from_le_bytes(chunk.try_into().unwrap()))
+                        data.as_chunks::<{ std::mem::size_of::<usize>() }>()
+                            .0
+                            .iter()
+                            .map(|chunk| usize::from_le_bytes(*chunk))
                             .collect_vec(),
                     );
                 }
@@ -1932,7 +1934,9 @@ impl TrapReader {
         let records = data.get(WORD_SIZE..WORD_SIZE.checked_add(records_len)?)?;
 
         records
-            .chunks_exact(RECORD_SIZE)
+            .as_chunks::<RECORD_SIZE>()
+            .0
+            .iter()
             .map(|record| {
                 let code_offset = u32::from_le_bytes(record[..WORD_SIZE].try_into().ok()?);
                 let code = u32::from_le_bytes(record[WORD_SIZE..].try_into().ok()?);

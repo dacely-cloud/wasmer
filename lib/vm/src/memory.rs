@@ -490,7 +490,7 @@ impl LinearMemory for VMOwnedMemory {
     /// Copy-on-write snapshots are supported for static-style memories on Linux,
     /// whose base address never moves on `memory.grow`.
     fn supports_cow_snapshot(&self) -> bool {
-        cfg!(target_os = "linux") && matches!(self.config.style(), MemoryStyle::Static { .. })
+        cfg!(target_os = "linux") && matches!(self.config.style(), MemoryStyle::Static)
     }
 
     fn snapshot_cow(&self) -> Result<CowBacking, MemoryError> {
