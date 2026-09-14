@@ -1,4 +1,3 @@
-use tracing::warn;
 use wasmer::{AsStoreMut, FunctionEnv, Imports, Instance, Memory, Module};
 
 use crate::WasiEnv;
@@ -14,35 +13,27 @@ pub(super) fn instantiate_with_runtime_hooks(
 ) -> Result<Instance, LinkError> {
     let runtime = env.as_ref(store).runtime.clone();
 
-    {
+    let instantiation_state = {
         let mut store_mut = store.as_store_mut();
-        let additional_imports = runtime
-            .additional_imports(module, &mut store_mut)
-            .map_err(LinkError::RuntimeHookError)?;
-        merge_missing_imports(imports, &additional_imports);
-    }
+        runtime
+            .prepare_imports(module, &mut store_mut, imports)
+            .map_err(LinkError::RuntimeHookError)?
+    };
 
     let instance = Instance::new(store, module, imports)?;
 
     {
         let mut store_mut = store.as_store_mut();
         runtime
-            .configure_new_instance(module, &mut store_mut, &instance, Some(imported_memory))
+            .configure_new_instance(
+                module,
+                &mut store_mut,
+                &instance,
+                Some(imported_memory),
+                instantiation_state,
+            )
             .map_err(LinkError::RuntimeHookError)?;
     }
 
     Ok(instance)
-}
-
-fn merge_missing_imports(imports: &mut Imports, additional_imports: &Imports) {
-    for (namespace, name, value) in additional_imports.iter() {
-        if imports.exists(namespace, name) {
-            warn!(
-                "Skipping duplicate additional import {}.{}",
-                namespace, name
-            );
-        } else {
-            imports.define(namespace, name, value.clone());
-        }
-    }
 }

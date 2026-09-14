@@ -60,17 +60,16 @@ jobs:
         shell: bash
         run: |
           cd $HOME
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf ${{ env.LLVM_URL }} -L -o llvm.tar.xz
           LLVM_DIR=$HOME/.llvm
           mkdir ${LLVM_DIR}
-          tar xf llvm.tar.xz --strip-components=1 -C ${LLVM_DIR}
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf "${{ env.LLVM_URL }}" -L -o - | tar --zstd -xvf - --strip-components=1 -C ${LLVM_DIR}
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           echo "${LLVM_DIR}/usr/bin" >> $GITHUB_PATH
           echo "LLVM_SYS_221_PREFIX=${LLVM_DIR}" >> $GITHUB_ENV
           echo "ENABLE_LLVM=1" >> $GITHUB_ENV
           cd -
         env:
-          LLVM_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz
+          LLVM_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst
       - name: Install wasixcc
         uses: wasix-org/wasixcc@v0.4.3
         with:
@@ -81,6 +80,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: WASIXCC_SYSROOT_PREFIX=~/.wasixcc/sysroot-v2026-05-12.1 wasixccenv download-sysroot v2026-05-12.1
+      - name: Install cargo-wasix
+        uses: wasix-org/cargo-wasix@main
+        with:
+          toolchain-version: ${{ env.WASIX_RUST_TOOLCHAIN_TAG }}
       - name: Install wasm-tools
         run: |
           cargo install --locked wasm-tools
@@ -95,6 +98,8 @@ jobs:
           wasm-tools --version
           # Check wasixcc is installed
           wasixcc --version
+          # Check cargo-wasix is installed
+          cargo wasix --version
           # Check wasm-opt is available
           wasm-opt --version
           # Check that the repo exists

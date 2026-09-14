@@ -16,7 +16,8 @@ use wasmer_compiler::{
     wasmparser::MemArg,
 };
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode,
+    TrapInformation, VMOffsets,
     target::{CallingConvention, Target},
 };
 
@@ -1912,6 +1913,8 @@ impl Machine for MachineRiscv {
     type GPR = GPR;
     type SIMD = FPR;
 
+    const STACK_ALIGNMENT: usize = 16;
+
     fn assembler_get_offset(&self) -> Offset {
         self.assembler.get_offset()
     }
@@ -2065,14 +2068,6 @@ impl Machine for MachineRiscv {
             Location::Imm64(stack_adjust as _),
             Location::GPR(GPR::Sp),
         )
-    }
-
-    fn round_stack_adjust(&self, value: usize) -> usize {
-        if value & 0xf != 0 {
-            ((value >> 4) + 1) << 4
-        } else {
-            value
-        }
     }
 
     fn set_srcloc(&mut self, offset: u32) {
@@ -2234,11 +2229,7 @@ impl Machine for MachineRiscv {
         Ok(())
     }
 
-    fn list_to_save(&self, _calling_convention: CallingConvention) -> Vec<Location> {
-        vec![]
-    }
-
-    fn get_param_registers(&self, _calling_convention: CallingConvention) -> &'static [Self::GPR] {
+    fn get_param_registers(&self) -> &'static [Self::GPR] {
         &[
             GPR::X10,
             GPR::X11,
@@ -2256,9 +2247,9 @@ impl Machine for MachineRiscv {
         idx: usize,
         _sz: Size,
         stack_args: &mut usize,
-        calling_convention: CallingConvention,
+        _calling_convention: CallingConvention,
     ) -> Location {
-        let register_params: &[GPR] = self.get_param_registers(calling_convention);
+        let register_params: &[GPR] = self.get_param_registers();
         if let Some(reg) = register_params.get(idx) {
             Location::GPR(*reg)
         } else {
@@ -2274,31 +2265,23 @@ impl Machine for MachineRiscv {
         idx: usize,
         _sz: Size,
         stack_args: &mut usize,
-        calling_convention: CallingConvention,
+        _calling_convention: CallingConvention,
     ) -> Location {
         let return_values_memory_size =
             8 * return_slots.saturating_sub(RISCV_RETURN_VALUE_REGISTERS.len()) as i32;
-        self.get_param_registers(calling_convention)
-            .get(idx)
-            .map_or_else(
-                || {
-                    let loc = Location::Memory(
-                        GPR::Fp,
-                        16 + return_values_memory_size + *stack_args as i32,
-                    );
-                    *stack_args += 8;
-                    loc
-                },
-                |reg| Location::GPR(*reg),
-            )
+        self.get_param_registers().get(idx).map_or_else(
+            || {
+                let loc =
+                    Location::Memory(GPR::Fp, 16 + return_values_memory_size + *stack_args as i32);
+                *stack_args += 8;
+                loc
+            },
+            |reg| Location::GPR(*reg),
+        )
     }
 
-    fn get_simple_param_location(
-        &self,
-        idx: usize,
-        calling_convention: CallingConvention,
-    ) -> Self::GPR {
-        self.get_param_registers(calling_convention)[idx]
+    fn get_simple_param_location(&self, idx: usize) -> Self::GPR {
+        self.get_param_registers()[idx]
     }
 
     fn adjust_gpr_param_location(
@@ -2328,7 +2311,6 @@ impl Machine for MachineRiscv {
         &self,
         idx: usize,
         stack_location: &mut usize,
-        _calling_convention: CallingConvention,
     ) -> AbstractLocation<Self::GPR, Self::SIMD> {
         RISCV_RETURN_VALUE_REGISTERS.get(idx).map_or_else(
             || {
@@ -2343,7 +2325,6 @@ impl Machine for MachineRiscv {
     fn get_call_return_value_location(
         &self,
         idx: usize,
-        _calling_convention: CallingConvention,
     ) -> AbstractLocation<Self::GPR, Self::SIMD> {
         RISCV_RETURN_VALUE_REGISTERS.get(idx).map_or_else(
             || {
@@ -4249,7 +4230,6 @@ impl Machine for MachineRiscv {
 
     fn emit_call_with_reloc(
         &mut self,
-        _calling_convention: CallingConvention,
         reloc_target: RelocationTarget,
     ) -> Result<Vec<Relocation>, CompileError> {
         let mut relocations = vec![];
@@ -6551,8 +6531,9 @@ impl Machine for MachineRiscv {
         &self,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_trampoline_riscv(sig, calling_convention)
+        gen_std_trampoline_riscv(sig, calling_convention, progress_callback)
     }
 
     fn gen_std_dynamic_import_trampoline(
@@ -6560,8 +6541,9 @@ impl Machine for MachineRiscv {
         vmoffsets: &VMOffsets,
         sig: &FunctionType,
         _calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_dynamic_import_trampoline_riscv(vmoffsets, sig)
+        gen_std_dynamic_import_trampoline_riscv(vmoffsets, sig, progress_callback)
     }
     // Singlepass calls import functions through a trampoline.
 
@@ -6571,8 +6553,15 @@ impl Machine for MachineRiscv {
         index: FunctionIndex,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<CustomSection, CompileError> {
-        gen_import_call_trampoline_riscv(vmoffsets, index, sig, calling_convention)
+        gen_import_call_trampoline_riscv(
+            vmoffsets,
+            index,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
 
     #[cfg(feature = "unwind")]

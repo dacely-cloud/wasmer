@@ -1,6 +1,7 @@
 //! This file is mainly to assure specific issues are working well
 
 use anyhow::{Context, Result};
+use bytesize::ByteSize;
 use itertools::Itertools;
 use wasmer::FunctionEnv;
 use wasmer::*;
@@ -536,6 +537,141 @@ fn issue_5309_reftype_panic(mut config: crate::Config) -> Result<()> {
 
     let mut store = config.store();
     let _ = Module::new(&store, wat);
+
+    Ok(())
+}
+
+#[compiler_test(issues)]
+fn local_and_imported_tables(mut config: crate::Config) -> Result<()> {
+    let mut store = config.store();
+
+    let imported_table0 = Table::new(
+        &mut store,
+        TableType::new(Type::FuncRef, 1, Some(2)),
+        Value::FuncRef(None),
+    )?;
+    let imported_table1 = Table::new(
+        &mut store,
+        TableType::new(Type::FuncRef, 2, Some(3)),
+        Value::FuncRef(None),
+    )?;
+    let imports = imports! {
+        "env" => {
+            "imported_table0" => imported_table0,
+            "imported_table1" => imported_table1,
+        },
+    };
+
+    let wasm_bytes = wat2wasm(
+        br#"
+        (module
+          (type $target_type (func (result i32)))
+          (import "env" "imported_table0" (table $imported0 1 2 funcref))
+          (import "env" "imported_table1" (table $imported1 2 3 funcref))
+          (table $local 3 4 funcref)
+
+          (func $target (type $target_type) (result i32)
+            i32.const 42)
+          (elem (table $imported0) (i32.const 0) func $target)
+
+          (func (export "size_imported0") (result i32)
+            table.size $imported0)
+          (func (export "get_imported0") (result i32)
+            i32.const 0
+            table.get $imported0
+            ref.is_null)
+          (func (export "set_imported0")
+            i32.const 0
+            ref.func $target
+            table.set $imported0)
+          (func (export "call_imported0") (result i32)
+            i32.const 0
+            call_indirect $imported0 (type $target_type))
+          (func (export "grow_imported0") (result i32)
+            ref.null func
+            i32.const 1
+            table.grow $imported0)
+
+          (func (export "size_imported1") (result i32)
+            table.size $imported1)
+          (func (export "get_imported1") (result i32)
+            i32.const 1
+            table.get $imported1
+            ref.is_null)
+          (func (export "set_imported1")
+            i32.const 1
+            ref.func $target
+            table.set $imported1)
+          (func (export "call_imported1") (result i32)
+            i32.const 1
+            call_indirect $imported1 (type $target_type))
+          (func (export "grow_imported1") (result i32)
+            ref.null func
+            i32.const 1
+            table.grow $imported1)
+
+          (func (export "size_local") (result i32)
+            table.size $local)
+          (func (export "get_local") (result i32)
+            i32.const 2
+            table.get $local
+            ref.is_null)
+          (func (export "set_local")
+            i32.const 2
+            ref.func $target
+            table.set $local)
+          (func (export "call_local") (result i32)
+            i32.const 2
+            call_indirect $local (type $target_type))
+          (func (export "grow_local") (result i32)
+            ref.null func
+            i32.const 1
+            table.grow $local)
+        )
+        "#,
+    )?;
+
+    let module = Module::new(&store, wasm_bytes)?;
+    let instance = Instance::new(&mut store, &module, &imports)?;
+    let size_imported0 = instance.exports.get_function("size_imported0")?;
+    let get_imported0 = instance.exports.get_function("get_imported0")?;
+    let set_imported0 = instance.exports.get_function("set_imported0")?;
+    let call_imported0 = instance.exports.get_function("call_imported0")?;
+    let grow_imported0 = instance.exports.get_function("grow_imported0")?;
+
+    let size_imported1 = instance.exports.get_function("size_imported1")?;
+    let get_imported1 = instance.exports.get_function("get_imported1")?;
+    let set_imported1 = instance.exports.get_function("set_imported1")?;
+    let call_imported1 = instance.exports.get_function("call_imported1")?;
+    let grow_imported1 = instance.exports.get_function("grow_imported1")?;
+
+    let size_local = instance.exports.get_function("size_local")?;
+    let get_local = instance.exports.get_function("get_local")?;
+    let set_local = instance.exports.get_function("set_local")?;
+    let call_local = instance.exports.get_function("call_local")?;
+    let grow_local = instance.exports.get_function("grow_local")?;
+
+    // It's already initialized by 'elem'.
+    assert_eq!(&*get_imported0.call(&mut store, &[])?, &[Value::I32(0)]);
+    assert_eq!(&*size_imported0.call(&mut store, &[])?, &[Value::I32(1)]);
+    assert!(set_imported0.call(&mut store, &[])?.is_empty());
+    assert_eq!(&*call_imported0.call(&mut store, &[])?, &[Value::I32(42)]);
+    assert_eq!(&*grow_imported0.call(&mut store, &[])?, &[Value::I32(1)]);
+    assert_eq!(&*size_imported0.call(&mut store, &[])?, &[Value::I32(2)]);
+
+    assert_eq!(&*get_imported1.call(&mut store, &[])?, &[Value::I32(1)]);
+    assert_eq!(&*size_imported1.call(&mut store, &[])?, &[Value::I32(2)]);
+    assert!(set_imported1.call(&mut store, &[])?.is_empty());
+    assert_eq!(&*call_imported1.call(&mut store, &[])?, &[Value::I32(42)]);
+    assert_eq!(&*grow_imported1.call(&mut store, &[])?, &[Value::I32(2)]);
+    assert_eq!(&*size_imported1.call(&mut store, &[])?, &[Value::I32(3)]);
+
+    assert_eq!(&*get_local.call(&mut store, &[])?, &[Value::I32(1)]);
+    assert_eq!(&*size_local.call(&mut store, &[])?, &[Value::I32(3)]);
+    assert!(set_local.call(&mut store, &[])?.is_empty());
+    assert_eq!(&*call_local.call(&mut store, &[])?, &[Value::I32(42)]);
+    assert_eq!(&*grow_local.call(&mut store, &[])?, &[Value::I32(3)]);
+    assert_eq!(&*size_local.call(&mut store, &[])?, &[Value::I32(4)]);
 
     Ok(())
 }
@@ -1245,6 +1381,42 @@ fn issue_6534_declared_element_segment_with_global(config: crate::Config) -> Res
     let run: TypedFunction<i32, i32> = instance.exports.get_typed_function(&store, "run")?;
 
     assert_eq!(run.call(&mut store, 41)?, 42);
+
+    Ok(())
+}
+
+#[compiler_test(issues)]
+fn nested_blocks_with_large_br_table(mut config: crate::Config) -> Result<()> {
+    const MAX_NESTED_BLOCKS: usize = 4096;
+    const MAX_BR_TABLE_VALUES: usize = 10_000;
+
+    let mut store = config.store();
+
+    let nested_blocks = MAX_NESTED_BLOCKS;
+    let branch_depth = nested_blocks - 1;
+    let branch_targets =
+        std::iter::repeat_n(branch_depth.to_string(), MAX_BR_TABLE_VALUES).join(" ");
+    let wat = format!(
+        "(module
+                (func (export \"run\") (result i32)
+                    {}
+                    i64.const 0
+                    i32.const 100
+                    br_table {}
+                    {}
+                    drop
+                    i32.const 0))",
+        "block (result i64)\n".repeat(nested_blocks),
+        branch_targets,
+        "end\n".repeat(nested_blocks),
+    );
+
+    let module = Module::new(&store, wat)?;
+    let artifact_size = module.serialize()?.len();
+    assert!(artifact_size < ByteSize::mib(1).as_u64() as usize);
+    let instance = Instance::new(&mut store, &module, &imports! {})?;
+    let run: TypedFunction<(), i32> = instance.exports.get_typed_function(&store, "run")?;
+    assert_eq!(run.call(&mut store)?, 0);
 
     Ok(())
 }

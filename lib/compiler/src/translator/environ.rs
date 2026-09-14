@@ -1,13 +1,13 @@
 // This file contains code from external sources.
 // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 use super::state::ModuleTranslationState;
-use crate::lib::std::string::ToString;
-use crate::lib::std::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use crate::translate_module;
 use crate::wasmparser::{Operator, ValType};
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::ops::Range;
+use std::string::ToString;
+use std::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use wasmer_types::FunctionType;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::{
@@ -25,7 +25,7 @@ pub struct FunctionBodyData<'a> {
     pub data: &'a [u8],
 
     /// Body offset relative to the module file.
-    pub module_offset: usize,
+    pub module_offset: u64,
 }
 
 /// Trait for iterating over the operators of a Wasm Function
@@ -411,7 +411,7 @@ impl<'data> ModuleEnvironment<'data> {
         &mut self,
         _module_translation_state: &ModuleTranslationState,
         body_bytes: &'data [u8],
-        body_offset: usize,
+        body_offset: u64,
     ) -> WasmResult<()> {
         self.function_body_inputs.push(FunctionBodyData {
             data: body_bytes,
@@ -442,9 +442,9 @@ impl<'data> ModuleEnvironment<'data> {
         Ok(())
     }
 
-    pub(crate) fn reserve_passive_data(&mut self, count: u32) -> WasmResult<()> {
-        let count = usize::try_from(count).unwrap();
-        self.module.passive_data.reserve(count);
+    pub(crate) fn reserve_passive_data(&mut self, _count: u32) -> WasmResult<()> {
+        // `passive_data` is a `BTreeMap`, which does not require reserving
+        // capacity before insertion.
         Ok(())
     }
 

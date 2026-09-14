@@ -161,6 +161,8 @@ pub struct BinaryPackage {
     pub id: PackageId,
     /// Includes the ids of all the packages in the tree
     pub package_ids: Vec<PackageId>,
+    /// The WebC format version of the root package.
+    pub webc_version: webc::Version,
 
     pub when_cached: Option<u128>,
     /// The name of the [`BinaryPackageCommand`] which is this package's
@@ -357,10 +359,11 @@ mod tests {
     use super::*;
 
     fn task_manager() -> Arc<dyn VirtualTaskManager + Send + Sync> {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "sys-thread")] {
+        cfg_select! {
+            feature = "sys-thread" => {
                 Arc::new(crate::runtime::task_manager::tokio::TokioTaskManager::new(tokio::runtime::Handle::current()))
-            } else {
+            }
+            _ => {
                 unimplemented!("Unable to get the task manager")
             }
         }

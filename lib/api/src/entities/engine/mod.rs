@@ -69,6 +69,11 @@ impl Engine {
         self.be.deterministic_id()
     }
 
+    /// Returns the format used for artifacts produced by this engine.
+    pub fn artifact_format(&self) -> String {
+        self.be.artifact_format()
+    }
+
     /// Returns the unique id of this engine.
     pub fn id(&self) -> EngineId {
         EngineId(self.id)
@@ -231,7 +236,9 @@ impl Engine {
     pub fn supports_async(&self) -> bool {
         match self.be {
             #[cfg(feature = "sys")]
-            BackendEngine::Sys(ref e) => true,
+            BackendEngine::Sys(_) => true,
+            #[cfg(feature = "js")]
+            BackendEngine::Js(_) => crate::backend::js::jspi::is_supported(),
             _ => false,
         }
     }

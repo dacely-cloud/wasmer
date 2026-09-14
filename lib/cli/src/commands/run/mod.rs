@@ -134,14 +134,7 @@ impl Run {
 
         let hooks = wasmer_napi::NapiCtx::default().runtime_hooks();
         Ok(Arc::new(
-            OverriddenRuntime::new(runtime)
-                .with_additional_imports({
-                    let hooks = hooks.clone();
-                    move |module, store| hooks.additional_imports(module, store)
-                })
-                .with_instance_setup(move |module, store, instance, imported_memory| {
-                    hooks.configure_instance(module, store, instance, imported_memory)
-                }),
+            OverriddenRuntime::new(runtime).with_instantiation_hook(hooks),
         ))
     }
 
@@ -352,6 +345,14 @@ impl Run {
         }
 
         pb.finish_and_clear();
+
+        if let ExecutableTarget::Package(pkg) = &target
+            && pkg.webc_version == webc::Version::V2
+        {
+            crate::warning!(
+                "WebC v2 is a deprecated format and support for it will be removed in a future release"
+            );
+        }
 
         // push the TTY state so we can restore it after the program finishes
         let tty = runtime.tty().map(|tty| tty.tty_get());
@@ -590,7 +591,7 @@ impl Run {
         runner
             .with_args(&self.args)
             .with_injected_packages(packages)
-            .with_envs(self.wasi.env_vars.clone())
+            .with_envs(self.wasi.resolved_env_vars()?)
             .with_mapped_host_commands(self.wasi.build_mapped_commands()?)
             .with_mapped_directories(mapped_directories)
             .with_home_mapped(is_home_mapped)
@@ -713,14 +714,7 @@ fn maybe_wrap_runtime_with_wasm_c_api(
                 .context("failed to resolve Wasm C API module")
         });
     Ok(Arc::new(
-        OverriddenRuntime::new(runtime)
-            .with_additional_imports({
-                let hooks = hooks.clone();
-                move |module, store| hooks.additional_imports(module, store)
-            })
-            .with_instance_setup(move |module, store, instance, imported_memory| {
-                hooks.configure_instance(module, store, instance, imported_memory)
-            }),
+        OverriddenRuntime::new(runtime).with_instantiation_hook(hooks),
     ))
 }
 
@@ -908,7 +902,7 @@ mod tests {
             .expect("runtime wrapper is installed");
         let mut import_store = runtime.new_store();
         let mut import_store_mut = import_store.as_store_mut();
-        let imports = runtime
+        let (imports, _state) = runtime
             .additional_imports(&module, &mut import_store_mut)
             .expect("wasm c api imports are created");
         assert!(imports.exists("wasm_c_api_v0", "wasm_engine_new"));

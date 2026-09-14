@@ -2,9 +2,7 @@ use crate::engine::error::LinkError;
 use std::ptr::NonNull;
 use wasmer_types::{
     FunctionType, GlobalType, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex,
-    MemoryType, ModuleInfo, Pages, TableIndex, TableType, TagKind,
-    entity::{EntityRef, PrimaryMap},
-    target::{PointerWidth, Target},
+    MemoryType, ModuleInfo, TableIndex, TableType, TagKind, entity::PrimaryMap,
 };
 use wasmer_vm::{InternalStoreHandle, MemoryError, StoreObjects, VMTag};
 use wasmer_vm::{MemoryStyle, TableStyle};
@@ -90,14 +88,12 @@ pub trait Tunables {
             let num_imports = module.num_imported_memories;
             let mut memories: PrimaryMap<LocalMemoryIndex, _> =
                 PrimaryMap::with_capacity(module.memories.len() - num_imports);
-            for (index, mdl) in memory_definition_locations
+            for ((mi, ty), mdl) in module
+                .memories
                 .iter()
-                .enumerate()
-                .take(module.memories.len())
                 .skip(num_imports)
+                .zip(memory_definition_locations)
             {
-                let mi = MemoryIndex::new(index);
-                let ty = &module.memories[mi];
                 let style = &memory_styles[mi];
                 memories.push(InternalStoreHandle::new(
                     context,
@@ -127,14 +123,12 @@ pub trait Tunables {
             let num_imports = module.num_imported_tables;
             let mut tables: PrimaryMap<LocalTableIndex, _> =
                 PrimaryMap::with_capacity(module.tables.len() - num_imports);
-            for (index, tdl) in table_definition_locations
+            for ((ti, ty), tdl) in module
+                .tables
                 .iter()
-                .enumerate()
-                .take(module.tables.len())
                 .skip(num_imports)
+                .zip(table_definition_locations)
             {
-                let ti = TableIndex::new(index);
-                let ty = &module.tables[ti];
                 let style = &table_styles[ti];
                 tables.push(InternalStoreHandle::new(
                     context,
@@ -192,73 +186,20 @@ pub trait Tunables {
 /// implementation or use composition to wrap your Tunables around
 /// this one. The later approach is demonstrated in the
 /// tunables-limit-memory example.
-#[derive(Clone)]
-pub struct BaseTunables {
-    /// For static heaps, the size in wasm pages of the heap protected by bounds checking.
-    pub static_memory_bound: Pages,
-
-    /// The size in bytes of the offset guard for static heaps.
-    pub static_memory_offset_guard_size: u64,
-
-    /// The size in bytes of the offset guard for dynamic heaps.
-    pub dynamic_memory_offset_guard_size: u64,
-}
+#[derive(Clone, Default)]
+pub struct BaseTunables {}
 
 impl BaseTunables {
-    /// Get the `BaseTunables` for a specific Target
-    pub fn for_target(target: &Target) -> Self {
-        let triple = target.triple();
-        let pointer_width: PointerWidth = triple.pointer_width().unwrap();
-        let (static_memory_bound, static_memory_offset_guard_size): (Pages, u64) =
-            match pointer_width {
-                PointerWidth::U16 => (0x400.into(), 0x1000),
-                PointerWidth::U32 => (0x4000.into(), 0x1_0000),
-                // Static Memory Bound:
-                //   Allocating 4 GiB of address space let us avoid the
-                //   need for explicit bounds checks.
-                // Static Memory Guard size:
-                //   Allocating 2 GiB of address space lets us translate wasm
-                //   offsets into x86 offsets as aggressively as we can.
-                PointerWidth::U64 => (0x1_0000.into(), 0x8000_0000),
-            };
-
-        // Allocate a small guard to optimize common cases but without
-        // wasting too much memory.
-        // The Windows memory manager seems more laxed than the other ones
-        // And a guard of just 1 page may not be enough is some borderline cases
-        // So using 2 pages for guard on this platform
-        #[cfg(target_os = "windows")]
-        let dynamic_memory_offset_guard_size: u64 = 0x2_0000;
-        #[cfg(not(target_os = "windows"))]
-        let dynamic_memory_offset_guard_size: u64 = 0x1_0000;
-
-        Self {
-            static_memory_bound,
-            static_memory_offset_guard_size,
-            dynamic_memory_offset_guard_size,
-        }
+    /// Get the default `BaseTunables`.
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
 impl Tunables for BaseTunables {
-    /// Get a `MemoryStyle` for the provided `MemoryType`
-    fn memory_style(&self, memory: &MemoryType) -> MemoryStyle {
-        // A heap with a maximum that doesn't exceed the static memory bound specified by the
-        // tunables make it static.
-        //
-        // If the module doesn't declare an explicit maximum treat it as 4GiB.
-        let maximum = memory.maximum.unwrap_or_else(Pages::max_value);
-        if maximum <= self.static_memory_bound {
-            MemoryStyle::Static {
-                // Bound can be larger than the maximum for performance reasons
-                bound: self.static_memory_bound,
-                offset_guard_size: self.static_memory_offset_guard_size,
-            }
-        } else {
-            MemoryStyle::Dynamic {
-                offset_guard_size: self.dynamic_memory_offset_guard_size,
-            }
-        }
+    /// Always return Static memory style.
+    fn memory_style(&self, _memory: &MemoryType) -> MemoryStyle {
+        MemoryStyle::Static
     }
 
     /// Get a [`TableStyle`] for the provided [`TableType`].

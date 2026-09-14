@@ -1,6 +1,6 @@
 [Setup]
 AppName=Wasmer
-AppVersion=7.2.0
+AppVersion=7.4.0
 DefaultDirName={pf}\Wasmer
 DefaultGroupName=Wasmer
 Compression=lzma2
@@ -22,7 +22,6 @@ Root: HKCU; Subkey: "Environment"; ValueType:string; ValueName: "WASMER_CACHE_DI
 
 [Files]
 Source: "..\..\package\bin\*"; DestDir: "{app}\bin"
-Source: "..\..\package\include\*"; DestDir: "{app}\include"
 Source: "..\..\package\lib\*"; DestDir: "{app}\lib"
 Source: "..\..\package\LICENSE"; DestDir: "{app}"
 Source: "..\..\package\ATTRIBUTIONS"; DestDir: "{app}"
