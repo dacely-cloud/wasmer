@@ -194,6 +194,13 @@ impl BaseTunables {
     pub fn new() -> Self {
         Self {}
     }
+
+    /// Construct default tunables using the pre-7.4 target-aware API.
+    ///
+    /// Memory styles are now target-independent, so the target is unused.
+    pub fn for_target(_target: &wasmer_types::target::Target) -> Self {
+        Self::new()
+    }
 }
 
 impl Tunables for BaseTunables {
